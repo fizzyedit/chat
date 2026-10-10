@@ -51,6 +51,8 @@ const vtable: sdk.Plugin.VTable = .{
     .drawDocument = drawDocument,
     .closeDocument = closeDocument,
     .reloadDocument = reloadDocument,
+    .captureDocumentState = captureDocumentState,
+    .restoreDocumentState = restoreDocumentState,
     .isDirty = isDirty,
     .saveDocument = saveDocument,
 };
@@ -191,6 +193,27 @@ fn closeDocument(_: *anyopaque, handle: DocHandle) void {
 /// A transcript is written by the chat itself as each turn ends; one changed on disk while open
 /// is the chat's own write, and needs no reload.
 fn reloadDocument(_: *anyopaque, _: DocHandle) anyerror!void {}
+/// What a chat carries across a reload of this plugin (and a demo's snapshot): its transcript,
+/// which it saves here and reads back on restore, and the message being typed, carried in the
+/// bytes. A version byte first, so a build that reads it differently refuses it rather than
+/// misreading it.
+const state_version: u8 = 1;
+fn captureDocumentState(_: *anyopaque, handle: DocHandle, allocator: std.mem.Allocator) anyerror![]u8 {
+    const c = from(handle) orelse return error.DocumentNotFound;
+    try c.save();
+    const out = try allocator.alloc(u8, 1 + c.input.items.len);
+    out[0] = state_version;
+    @memcpy(out[1..], c.input.items);
+    return out;
+}
+fn restoreDocumentState(_: *anyopaque, handle: DocHandle, bytes: []const u8) anyerror!void {
+    const c = from(handle) orelse return error.DocumentNotFound;
+    if (bytes.len < 1 or bytes[0] != state_version) return error.BadState;
+    try c.reloadTranscript();
+    c.host.documentTitleChanged(handle);
+    c.input.clearRetainingCapacity();
+    try c.input.appendSlice(c.gpa, bytes[1..]);
+}
 fn isDirty(_: *anyopaque, _: DocHandle) bool {
     return false;
 }

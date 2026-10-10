@@ -153,6 +153,18 @@ fn load(self: *Chat, bytes: []const u8) !void {
     }
 }
 
+/// Read the transcript again from disk, in place of what the chat holds: what `restoreDocumentState`
+/// puts back, since capturing it saved it (`plugin.zig`).
+pub fn reloadTranscript(self: *Chat) !void {
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(dvui.io, self.path, self.gpa, .limited(64 * 1024 * 1024));
+    defer self.gpa.free(bytes);
+    for (self.entries.items) |*e| e.deinit(self.gpa);
+    self.entries.clearRetainingCapacity();
+    self.title.clearRetainingCapacity();
+    if (std.mem.trim(u8, bytes, " \t\r\n").len > 0) try self.load(bytes);
+    self.follow = true;
+}
+
 /// Write the transcript. Its first line names the chat, so the explorer lists chats without
 /// reading whole conversations.
 pub fn save(self: *Chat) !void {
@@ -715,6 +727,25 @@ pub fn draw(self: *Chat) !dvui.App.Result {
     }
 
     {
+        // Packed from the bottom (gravity 1), before the conversation: a long conversation's
+        // height cannot push it out of the tab (dvui's BoxWidget packs in order).
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .all(6), .gravity_y = 1 });
+        defer row.deinit();
+        const te = dvui.textEntry(@src(), .{
+            .text = .{ .array_list = .{ .backing = &self.input, .allocator = self.gpa, .limit = 64 * 1024 } },
+            .placeholder = "Ask the agent...",
+        }, .{
+            .expand = .horizontal,
+            .gravity_y = 0.5,
+            // Narrow enough to fit any panel (dvui's default is a dozen M's wide), a line tall.
+            .min_size_content = theme.font_body.sizeM(3, 1),
+        });
+        const enter = te.enter_pressed;
+        te.deinit();
+        const clicked = dvui.button(@src(), "Send", .{}, .{ .gravity_y = 0.5 });
+        if ((enter or clicked) and self.send(self.input.items)) self.input.clearRetainingCapacity();
+    }
+    {
         // Wrapped to the panel's width, never wider: the conversation scrolls one way.
         var scroll = dvui.scrollArea(@src(), .{ .horizontal = .none }, .{ .expand = .both });
         defer scroll.deinit();
@@ -743,23 +774,6 @@ pub fn draw(self: *Chat) !dvui.App.Result {
         }
     }
 
-    {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .all(6) });
-        defer row.deinit();
-        const te = dvui.textEntry(@src(), .{
-            .text = .{ .array_list = .{ .backing = &self.input, .allocator = self.gpa, .limit = 64 * 1024 } },
-            .placeholder = "Ask the agent...",
-        }, .{
-            .expand = .horizontal,
-            .gravity_y = 0.5,
-            // Narrow enough to fit any panel (dvui's default is a dozen M's wide), a line tall.
-            .min_size_content = theme.font_body.sizeM(3, 1),
-        });
-        const enter = te.enter_pressed;
-        te.deinit();
-        const clicked = dvui.button(@src(), "Send", .{}, .{ .gravity_y = 0.5 });
-        if ((enter or clicked) and self.send(self.input.items)) self.input.clearRetainingCapacity();
-    }
     return .ok;
 }
 
