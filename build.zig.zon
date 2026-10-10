@@ -8,8 +8,8 @@
         .fizzy = .{
             // The published SDK, not a path into a checkout: a release has to build from a
             // clean clone. To build against a local fizzy: `zig build --fork=<fizzy>/sdk`.
-            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.20/fizzy-sdk-v0.2.20.tar.gz",
-            .hash = "fizzy-0.2.20-SGBwY7BcIQAqHKHzaj0vwADkUQNdpiap19SmKZ29Rp0W",
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.21/fizzy-sdk-v0.2.21.tar.gz",
+            .hash = "fizzy-0.2.21-SGBwY85uIQAzaYoWqpLKQ-2qbiM6804QKeJ5pJ7wffyr",
         },
     },
 }
