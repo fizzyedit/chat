@@ -1,0 +1,48 @@
+# chat
+
+Talk to an AI agent in a fizzy panel, and watch it work in fizzy.
+
+One chat for any agent that speaks the [Agent Client Protocol](https://agentclientprotocol.com)
+(ACP): which agent runs is a setting, a command line, and the conversation looks the same for all
+of them. The agent gets fizzy's own tools (the screen as text, input, commands, the profiler)
+through the [agent plugin](https://github.com/fizzyedit/agent)'s `fizzy-mcp`, handed to it when a
+session opens, so the agent you talk to is the one driving fizzy.
+
+## Use it
+
+```sh
+zig build      # installs into fizzy's plugins directory (or FIZZY_PROFILE's)
+```
+
+Enable **Chat** (and **Agent**, for fizzy's tools) in fizzy's plugin settings, set
+**Settings > Chat > Agent command**, open Chat from the sidebar and press Start.
+
+Agent commands, as their projects publish them (check each for the current form):
+
+| Agent | Command |
+|---|---|
+| Claude | `npx -y @agentclientprotocol/claude-agent-acp` |
+| Codex | `npx -y @zed-industries/codex-acp` (reads `OPENAI_API_KEY` / `CODEX_API_KEY`) |
+| Gemini CLI, GitHub Copilot, Goose, OpenCode, … | each agent's own ACP mode; see agentclientprotocol.com's list |
+
+An agent that signs in through its own CLI works as it is. One that wants an API key in its
+environment needs fizzy to pass it on, which comes later (the agents plan names the seam).
+
+## What it does so far
+
+- Starts the agent, opens a session in the project folder, and hands it `fizzy-mcp`.
+- Streams the agent's messages and thoughts, its plan, and its tool calls as they run.
+- Asks you before the agent acts when it requests permission, with the agent's own options.
+- Stops a turn (Stop), or the agent (Restart).
+
+Next: the agent's file reads and writes going through fizzy's open documents as undoable edits,
+diffs shown before they land, and terminals.
+
+## How it fits together
+
+- `src/acp.zig`: the wire. JSON-RPC 2.0, one message per line on the agent's stdio. std-only,
+  tested with `zig build test`.
+- `src/Agent.zig`: the agent's process, spawned as fizzy spawns a language server (on macOS
+  through `core.darwin_spawn`, found on the login shell's PATH), with a reader thread queueing
+  lines for the UI thread.
+- `src/Chat.zig`: the conversation and the ACP state machine, on the UI thread, and the panel.
