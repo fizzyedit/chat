@@ -1,6 +1,8 @@
-//! One conversation with one agent, over ACP (`acp.zig`, `Agent.zig`), and the panel that shows
-//! it. UI thread only: `frame` takes what the agent sent since the last frame and acts on it;
-//! `draw` shows the conversation and takes what the person types.
+//! One conversation with one agent, over ACP (`acp.zig`, `Agent.zig`): a document, opened in a
+//! tab like any file. Its transcript is a `.chat` file in fizzy's config folder (`Explorer.zig`
+//! lists them), saved as each turn ends. Each open chat runs its own agent, started when the
+//! person presses Start. UI thread only: `frame` takes what the agent sent since the last frame
+//! and acts on it; `draw` shows the conversation and takes what the person types.
 //!
 //! The agent gets fizzy's tools through `fizzy-mcp`, which the agent plugin installs beside
 //! itself: `session/new` names it in `mcpServers`, pointed at this fizzy's profile, so the agent
@@ -17,7 +19,12 @@ const json = std.json;
 
 gpa: std.mem.Allocator,
 host: *sdk.Host,
-settings: *const Settings,
+/// The document: fizzy's id for it, its transcript's path, and the pane it is in.
+id: u64,
+path: []u8,
+grouping: u64 = 0,
+/// The tab's name (`documentTitle`): the first thing the person asked, cut short. Empty until then.
+title: std.ArrayListUnmanaged(u8) = .empty,
 agent: ?*Agent = null,
 state: State = .idle,
 /// What the agent calls itself (`initialize`'s `agentInfo`).
@@ -34,6 +41,9 @@ follow: bool = false,
 /// The `fizzy-mcp` handed to the agent, when there is one.
 mcp_path: ?[]u8 = null,
 
+/// The chat plugin's settings, which every chat reads (set once, in `register`).
+pub var settings: *const Settings = undefined;
+
 pub const State = enum { idle, starting, ready, prompting, stopped };
 const Pending = enum { initialize, session_new, prompt };
 
@@ -43,10 +53,11 @@ const Entry = struct {
     /// `tool`: the agent's `toolCallId`.
     tool_id: []u8 = &.{},
     status: ToolStatus = .pending,
-    /// `permission`: the request to answer, and its options; `answered` once it is.
+    /// `permission`: the request to answer, and its options, until it is answered (the answer
+    /// is then part of `text`).
     request: ?RequestId = null,
     options: []Option = &.{},
-    answered: ?[]const u8 = null,
+    answered: bool = false,
 
     const Kind = enum { user, agent, thought, tool, plan, permission, note, failure };
 
@@ -88,12 +99,81 @@ const RequestId = union(enum) {
     }
 };
 
+/// A chat from its transcript on disk; a path with no file yet is a new, empty chat.
+pub fn fromPath(path: []const u8) !Chat {
+    const gpa = sdk.allocator();
+    const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, gpa, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return fromBytes(path, ""),
+        else => return err,
+    };
+    defer gpa.free(bytes);
+    return fromBytes(path, bytes);
+}
+
+pub fn fromBytes(path: []const u8, bytes: []const u8) !Chat {
+    const gpa = sdk.allocator();
+    var self: Chat = .{ .gpa = gpa, .host = sdk.host(), .id = sdk.host().allocDocId(), .path = try gpa.dupe(u8, path) };
+    errdefer gpa.free(self.path);
+    if (std.mem.trim(u8, bytes, " \t\r\n").len > 0) self.load(bytes) catch |err| {
+        // A transcript fizzy cannot read still opens: say so, and keep the file as it is.
+        self.note("This transcript could not be read ({t}).", .{err});
+    };
+    self.follow = true;
+    return self;
+}
+
+/// What a transcript holds: the title, and each entry's kind, text and how its tool call ended.
+/// A request still open when it was saved was never answered, and is not kept as one.
+const Saved = struct {
+    title: []const u8 = "",
+    entries: []const struct { kind: Entry.Kind, text: []const u8, status: ToolStatus = .pending } = &.{},
+};
+
+fn load(self: *Chat, bytes: []const u8) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const source = try arena_state.allocator().dupeZ(u8, bytes);
+    const saved = try std.zon.parse.fromSliceAlloc(Saved, arena_state.allocator(), source, null, .{ .ignore_unknown_fields = true });
+    try self.title.appendSlice(self.gpa, saved.title);
+    for (saved.entries) |e| {
+        const entry = self.add(e.kind) orelse return error.OutOfMemory;
+        try entry.text.appendSlice(self.gpa, e.text);
+        entry.status = e.status;
+        entry.answered = true;
+    }
+}
+
+/// Write the transcript. Its first line names the chat, so the explorer lists chats without
+/// reading whole conversations.
+pub fn save(self: *Chat) !void {
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const Kept = @typeInfo(@FieldType(Saved, "entries")).pointer.child;
+    var kept: std.ArrayListUnmanaged(Kept) = .empty;
+    for (self.entries.items) |e| try kept.append(arena, .{ .kind = e.kind, .text = e.text.items, .status = e.status });
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try out.writer.print("// {s}\n", .{firstLine(self.title.items)});
+    try std.zon.stringify.serialize(Saved{ .title = self.title.items, .entries = kept.items }, .{}, &out.writer);
+    try out.writer.writeByte('\n');
+    if (std.fs.path.dirname(self.path)) |dir| std.Io.Dir.cwd().createDirPath(dvui.io, dir) catch {};
+    try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = self.path, .data = out.written() });
+    @import("Explorer.zig").changed();
+}
+
+fn firstLine(text: []const u8) []const u8 {
+    return text[0 .. std.mem.indexOfScalar(u8, text, '\n') orelse text.len];
+}
+
 pub fn deinit(self: *Chat) void {
+    self.save() catch {};
     self.disconnect();
     for (self.entries.items) |*e| e.deinit(self.gpa);
     self.entries.deinit(self.gpa);
     self.input.deinit(self.gpa);
     self.pending.deinit(self.gpa);
+    self.title.deinit(self.gpa);
+    self.gpa.free(self.path);
 }
 
 fn wake() void {
@@ -108,7 +188,7 @@ pub fn connect(self: *Chat) void {
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const line = std.mem.trim(u8, self.settings.agent_command.get(), " \t");
+    const line = std.mem.trim(u8, settings.agent_command.get(), " \t");
     if (line.len == 0) return self.fail("No agent to run. Set one in Settings > Chat: a command line for an agent " ++
         "that speaks the Agent Client Protocol, such as `npx -y @agentclientprotocol/claude-agent-acp`.", .{});
     const argv = acp.splitCommand(arena, line) catch return self.fail("Could not read the agent command.", .{});
@@ -118,7 +198,9 @@ pub fn connect(self: *Chat) void {
         else => return self.fail("Could not start the agent: {t}", .{err}),
     };
     self.state = .starting;
-    self.note("Starting `{s}`...", .{line});
+    if (self.entries.items.len > 0) {
+        self.note("Starting `{s}` in a new session: the agent does not remember what came before.", .{line});
+    } else self.note("Starting `{s}`...", .{line});
     self.request(.initialize, "initialize", .{
         .protocolVersion = acp.protocol_version,
         // Reading and writing files through fizzy's open documents, and terminals, come later
@@ -168,7 +250,7 @@ fn openSession(self: *Chat) void {
 
 /// The setting's fizzy-mcp, else the one beside the agent plugin. Owned by `gpa`.
 fn findMcp(self: *Chat) ?[]u8 {
-    const set = std.mem.trim(u8, self.settings.mcp_command.get(), " \t");
+    const set = std.mem.trim(u8, settings.mcp_command.get(), " \t");
     if (set.len > 0) return self.gpa.dupe(u8, set) catch null;
     const dir = self.host.pluginInstallDir("agent") orelse return null;
     defer self.host.allocator.free(dir);
@@ -190,6 +272,12 @@ pub fn prompt(self: *Chat, text: []const u8) void {
     if (trimmed.len == 0 or self.state != .ready) return;
     const e = self.add(.user) orelse return;
     e.text.appendSlice(self.gpa, trimmed) catch {};
+    // The chat is named by the first thing asked in it.
+    if (self.title.items.len == 0) {
+        const line = firstLine(trimmed);
+        self.title.appendSlice(self.gpa, line[0..@min(line.len, 60)]) catch {};
+        if (line.len > 60) self.title.appendSlice(self.gpa, "...") catch {};
+    }
     const Block = struct { type: []const u8, text: []const u8 };
     self.request(.prompt, "session/prompt", .{ .sessionId = session, .prompt = &[_]Block{.{ .type = "text", .text = trimmed }} });
     self.state = .prompting;
@@ -277,8 +365,11 @@ fn answered(self: *Chat, what: Pending, result: json.Value) void {
         .prompt => {
             self.state = .ready;
             self.cancelPermissions(false);
-            const reason = field(result, "stopReason") orelse return;
-            if (reason == .string and !std.mem.eql(u8, reason.string, "end_turn")) self.note("Stopped: {s}.", .{reason.string});
+            if (field(result, "stopReason")) |reason| {
+                if (reason == .string and !std.mem.eql(u8, reason.string, "end_turn")) self.note("Stopped: {s}.", .{reason.string});
+            }
+            // A turn is over: keep it.
+            self.save() catch |err| self.fail("Could not save this chat: {t}", .{err});
         },
     }
 }
@@ -367,15 +458,20 @@ fn askPermission(self: *Chat, id: json.Value, params: json.Value) void {
 fn choose(self: *Chat, e: *Entry, option: Option) void {
     const rid = e.request orelse return;
     self.write(acp.writeResult, .{ rid.value(), .{ .outcome = .{ .outcome = "selected", .optionId = option.id } } });
-    e.answered = option.name;
+    answer(self.gpa, e, option.name);
 }
 
-/// Answer every open permission request as cancelled (`answer`), or just close them.
-fn cancelPermissions(self: *Chat, answer: bool) void {
+fn answer(gpa: std.mem.Allocator, e: *Entry, what: []const u8) void {
+    e.answered = true;
+    e.text.print(gpa, "\nAnswered: {s}", .{what}) catch {};
+}
+
+/// Answer every open permission request as cancelled (`send_answer`), or just close them.
+fn cancelPermissions(self: *Chat, send_answer: bool) void {
     for (self.entries.items) |*e| {
-        if (e.kind != .permission or e.answered != null) continue;
-        if (answer) if (e.request) |rid| self.write(acp.writeResult, .{ rid.value(), .{ .outcome = .{ .outcome = "cancelled" } } });
-        e.answered = "cancelled";
+        if (e.kind != .permission or e.answered) continue;
+        if (send_answer) if (e.request) |rid| self.write(acp.writeResult, .{ rid.value(), .{ .outcome = .{ .outcome = "cancelled" } } });
+        answer(self.gpa, e, "cancelled");
     }
 }
 
@@ -550,10 +646,7 @@ fn drawEntry(self: *Chat, e: *Entry, i: usize, width: ?f32) void {
                 defer tl.deinit();
                 tl.addText(e.text.items, .{});
             }
-            if (e.answered) |a| {
-                dvui.label(@src(), "Answered: {s}", .{a}, faded);
-                return;
-            }
+            if (e.answered) return;
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
             defer row.deinit();
             for (e.options, 0..) |o, n| {

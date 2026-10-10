@@ -15,7 +15,12 @@ zig build      # installs into fizzy's plugins directory (or FIZZY_PROFILE's)
 ```
 
 Enable **Chat** (and **Agent**, for fizzy's tools) in fizzy's plugin settings, set
-**Settings > Chat > Agent command**, open Chat from the sidebar and press Start.
+**Settings > Chat > Agent command**, open **Chats** from the sidebar, press **New Chat**, and
+press Start in the chat's tab.
+
+Each conversation is a document: a `.chat` transcript in `<fizzy config>/chats/`, opened in a
+tab (several side by side, each with its own agent), saved as each turn ends, and listed in the
+Chats sidebar newest first. A tab is named by the first thing asked in it.
 
 Agent commands, as their projects publish them (check each for the current form):
 
@@ -45,4 +50,7 @@ diffs shown before they land, and terminals.
 - `src/Agent.zig`: the agent's process, spawned as fizzy spawns a language server (on macOS
   through `core.darwin_spawn`, found on the login shell's PATH), with a reader thread queueing
   lines for the UI thread.
-- `src/Chat.zig`: the conversation and the ACP state machine, on the UI thread, and the panel.
+- `src/Chat.zig`: a conversation, as a document: the ACP state machine on the UI thread, its
+  transcript, and its tab's view.
+- `src/Explorer.zig`: the Chats sidebar, listing transcripts without reading them whole (a
+  transcript's first line is its title).
