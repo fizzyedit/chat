@@ -149,9 +149,10 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
             .id_extra = i,
             .margin = .{ .x = 4, .w = 4 },
             .padding = .{ .x = 8, .y = 6, .w = 8, .h = 6 },
-            // The open chat on the control fill, its text as legible as the rest.
+            // The open chat on a light wash of the highlight, its text as legible as the rest.
             .background = is_active,
-            .style = if (is_active) .control else .content,
+            .color_fill = .{ .color = theme.color(.highlight, .fill).opacity(0.25) },
+            .corners = .all(6),
         });
         b.processEvents();
         b.drawBackground();

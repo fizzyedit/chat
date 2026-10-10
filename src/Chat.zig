@@ -40,9 +40,13 @@ input: std.ArrayList(u8) = .empty,
 follow: bool = false,
 /// The `fizzy-mcp` handed to the agent, when there is one.
 mcp_path: ?[]u8 = null,
+/// What the person sent before the agent was ready: sent once the session opens.
+queued: ?[]u8 = null,
 
-/// The chat plugin's settings, which every chat reads (set once, in `register`).
+/// The chat plugin's settings, which every chat reads, and the plugin itself, which owns every
+/// chat's `DocHandle` (both set once, in `register`).
 pub var settings: *const Settings = undefined;
+pub var owner: *sdk.Plugin = undefined;
 
 pub const State = enum { idle, starting, ready, prompting, stopped };
 const Pending = enum { initialize, session_new, prompt };
@@ -168,6 +172,7 @@ fn firstLine(text: []const u8) []const u8 {
 pub fn deinit(self: *Chat) void {
     self.save() catch {};
     self.disconnect();
+    if (self.queued) |q| self.gpa.free(q);
     for (self.entries.items) |*e| e.deinit(self.gpa);
     self.entries.deinit(self.gpa);
     self.input.deinit(self.gpa);
@@ -265,8 +270,36 @@ fn findMcp(self: *Chat) ?[]u8 {
 
 // ---- talking --------------------------------------------------------------------------------
 
-/// Send what the person typed as the next turn.
-pub fn prompt(self: *Chat, text: []const u8) void {
+/// What the person typed: the next turn now, or once the agent is ready (starting it if none
+/// runs). Nothing typed is dropped for being early. True when it was taken.
+pub fn send(self: *Chat, text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 or self.queued != null) return false;
+    switch (self.state) {
+        .ready => self.prompt(trimmed),
+        .prompting => return false,
+        .starting, .idle, .stopped => {
+            self.queued = self.gpa.dupe(u8, trimmed) catch return false;
+            if (self.agent == null) self.connect();
+            // It did not start: the message goes back where it was typed, not lost.
+            if (self.agent == null) {
+                self.unqueue();
+                return false;
+            }
+        },
+    }
+    return true;
+}
+
+/// Put a queued message back in the input box: the agent will not take it.
+fn unqueue(self: *Chat) void {
+    const q = self.queued orelse return;
+    self.queued = null;
+    defer self.gpa.free(q);
+    if (self.input.items.len == 0) self.input.appendSlice(self.gpa, q) catch {};
+}
+
+fn prompt(self: *Chat, text: []const u8) void {
     const session = self.session_id orelse return;
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
     if (trimmed.len == 0 or self.state != .ready) return;
@@ -277,6 +310,8 @@ pub fn prompt(self: *Chat, text: []const u8) void {
         const line = firstLine(trimmed);
         self.title.appendSlice(self.gpa, line[0..@min(line.len, 60)]) catch {};
         if (line.len > 60) self.title.appendSlice(self.gpa, "...") catch {};
+        // The tab follows (`documentTitle`); the Host keeps its own copy.
+        self.host.documentTitleChanged(.{ .ptr = self, .id = self.id, .owner = owner });
     }
     const Block = struct { type: []const u8, text: []const u8 };
     self.request(.prompt, "session/prompt", .{ .sessionId = session, .prompt = &[_]Block{.{ .type = "text", .text = trimmed }} });
@@ -327,6 +362,7 @@ pub fn frame(self: *Chat) void {
         const why = std.mem.trim(u8, agent.stderrTail(&buf), " \t\r\n");
         if (why.len > 0) self.fail("The agent stopped:\n{s}", .{why}) else self.fail("The agent stopped.", .{});
         self.disconnect();
+        self.unqueue();
     }
 }
 
@@ -361,6 +397,11 @@ fn answered(self: *Chat, what: Pending, result: json.Value) void {
             self.session_id = self.gpa.dupe(u8, id.string) catch null;
             self.state = .ready;
             if (self.mcp_path != null) self.note("Connected. The agent can see and drive fizzy.", .{}) else self.note("Connected.", .{});
+            if (self.queued) |q| {
+                self.queued = null;
+                defer self.gpa.free(q);
+                self.prompt(q);
+            }
         },
         .prompt => {
             self.state = .ready;
@@ -380,6 +421,7 @@ fn refused(self: *Chat, what: Pending, err: []const u8) void {
             // An agent that needs signing in says so here: its own CLI does that, once.
             self.fail("The agent refused to start: {s}", .{err});
             self.disconnect();
+            self.unqueue();
         },
         .prompt => {
             self.state = .ready;
@@ -564,7 +606,7 @@ pub fn draw(self: *Chat) !dvui.App.Result {
                 .padding = .all(10),
                 .color_text = .{ .color = theme.color(.content, .text).opacity(0.6) },
             });
-            hint.addText("Talk to an agent here. Start runs the one set in Settings > Chat.", .{});
+            hint.addText("Ask the agent anything: sending starts the one set in Settings > Chat.", .{});
             hint.deinit();
         }
         for (self.entries.items, 0..) |*e, i| self.drawEntry(e, i, width);
@@ -579,7 +621,7 @@ pub fn draw(self: *Chat) !dvui.App.Result {
         defer row.deinit();
         const te = dvui.textEntry(@src(), .{
             .text = .{ .array_list = .{ .backing = &self.input, .allocator = self.gpa, .limit = 64 * 1024 } },
-            .placeholder = if (self.state == .ready) "Ask the agent..." else "Start an agent to talk to it",
+            .placeholder = "Ask the agent...",
         }, .{
             .expand = .horizontal,
             .gravity_y = 0.5,
@@ -588,11 +630,8 @@ pub fn draw(self: *Chat) !dvui.App.Result {
         });
         const enter = te.enter_pressed;
         te.deinit();
-        const send = dvui.button(@src(), "Send", .{}, .{ .gravity_y = 0.5 });
-        if ((enter or send) and self.state == .ready) {
-            self.prompt(self.input.items);
-            self.input.clearRetainingCapacity();
-        }
+        const clicked = dvui.button(@src(), "Send", .{}, .{ .gravity_y = 0.5 });
+        if ((enter or clicked) and self.send(self.input.items)) self.input.clearRetainingCapacity();
     }
     return .ok;
 }

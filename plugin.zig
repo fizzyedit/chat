@@ -65,6 +65,7 @@ var chats: std.AutoArrayHashMapUnmanaged(u64, *Chat) = .empty;
 pub fn register(host: *sdk.Host) !void {
     Schema.load(host, plugin_id, &settings);
     Chat.settings = &settings;
+    Chat.owner = &plugin;
     plugin.state = @ptrCast(&settings);
     try host.registerPlugin(&plugin);
     try Schema.register(host, &plugin, .{ .title = "Chat", .value = &settings });
