@@ -36,8 +36,10 @@ pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
 entries: std.ArrayListUnmanaged(Entry) = .empty,
 /// What the person is typing.
 input: std.ArrayList(u8) = .empty,
-/// Scroll to the end on the next draw: something was added.
+/// Scroll to the end: something was added. Held for a few frames, since a layout's height is
+/// known only after it is drawn (a chat just opened is all new).
 follow: bool = false,
+follow_frames: u8 = 0,
 /// The `fizzy-mcp` handed to the agent, when there is one.
 mcp_path: ?[]u8 = null,
 /// What the person sent before the agent was ready: sent once the session opens.
@@ -54,6 +56,8 @@ const Pending = enum { initialize, session_new, prompt };
 const Entry = struct {
     kind: Kind,
     text: std.ArrayListUnmanaged(u8) = .empty,
+    /// `tool`: what the call carries to show beneath it, a diff or text, in a monospace face.
+    detail: std.ArrayListUnmanaged(u8) = .empty,
     /// `tool`: the agent's `toolCallId`.
     tool_id: []u8 = &.{},
     status: ToolStatus = .pending,
@@ -67,6 +71,7 @@ const Entry = struct {
 
     fn deinit(self: *Entry, gpa: std.mem.Allocator) void {
         self.text.deinit(gpa);
+        self.detail.deinit(gpa);
         gpa.free(self.tool_id);
         for (self.options) |o| {
             gpa.free(o.id);
@@ -130,7 +135,7 @@ pub fn fromBytes(path: []const u8, bytes: []const u8) !Chat {
 /// A request still open when it was saved was never answered, and is not kept as one.
 const Saved = struct {
     title: []const u8 = "",
-    entries: []const struct { kind: Entry.Kind, text: []const u8, status: ToolStatus = .pending } = &.{},
+    entries: []const struct { kind: Entry.Kind, text: []const u8, status: ToolStatus = .pending, detail: []const u8 = "" } = &.{},
 };
 
 fn load(self: *Chat, bytes: []const u8) !void {
@@ -142,6 +147,7 @@ fn load(self: *Chat, bytes: []const u8) !void {
     for (saved.entries) |e| {
         const entry = self.add(e.kind) orelse return error.OutOfMemory;
         try entry.text.appendSlice(self.gpa, e.text);
+        try entry.detail.appendSlice(self.gpa, e.detail);
         entry.status = e.status;
         entry.answered = true;
     }
@@ -155,7 +161,7 @@ pub fn save(self: *Chat) !void {
     const arena = arena_state.allocator();
     const Kept = @typeInfo(@FieldType(Saved, "entries")).pointer.child;
     var kept: std.ArrayListUnmanaged(Kept) = .empty;
-    for (self.entries.items) |e| try kept.append(arena, .{ .kind = e.kind, .text = e.text.items, .status = e.status });
+    for (self.entries.items) |e| try kept.append(arena, .{ .kind = e.kind, .text = e.text.items, .status = e.status, .detail = e.detail.items });
     var out: std.Io.Writer.Allocating = .init(arena);
     try out.writer.print("// {s}\n", .{firstLine(self.title.items)});
     try std.zon.stringify.serialize(Saved{ .title = self.title.items, .entries = kept.items }, .{}, &out.writer);
@@ -208,9 +214,9 @@ pub fn connect(self: *Chat) void {
     } else self.note("Starting `{s}`...", .{line});
     self.request(.initialize, "initialize", .{
         .protocolVersion = acp.protocol_version,
-        // Reading and writing files through fizzy's open documents, and terminals, come later
+        // Files go through fizzy's open documents (`readFile`, `writeFile`). Terminals come later
         // (plans/AGENTS_PLAN.md, "The chat plugin"): until then the agent uses its own.
-        .clientCapabilities = .{ .fs = .{ .readTextFile = false, .writeTextFile = false }, .terminal = false },
+        .clientCapabilities = .{ .fs = .{ .readTextFile = true, .writeTextFile = true }, .terminal = false },
         .clientInfo = .{ .name = "fizzy", .title = "Fizzy", .version = "0.1.0" },
     });
 }
@@ -376,7 +382,9 @@ fn handle(self: *Chat, msg: acp.Inbound) void {
         .notification => |n| if (std.mem.eql(u8, n.method, "session/update")) self.update(n.params),
         .request => |q| {
             if (std.mem.eql(u8, q.method, "session/request_permission")) return self.askPermission(q.id, q.params);
-            // Files and terminals are not offered (`initialize`'s capabilities): say so.
+            if (std.mem.eql(u8, q.method, "fs/read_text_file")) return self.readFile(q.id, q.params);
+            if (std.mem.eql(u8, q.method, "fs/write_text_file")) return self.writeFile(q.id, q.params);
+            // Terminals are not offered (`initialize`'s capabilities): say so.
             self.write(acp.writeError, .{ q.id, acp.method_not_found, "fizzy's chat does not offer this yet" });
         },
         .invalid => {},
@@ -443,6 +451,7 @@ fn update(self: *Chat, params: json.Value) void {
         e.tool_id = self.gpa.dupe(u8, str(field(u, "toolCallId")) orelse "") catch &.{};
         e.text.appendSlice(self.gpa, str(field(u, "title")) orelse "A tool") catch {};
         e.status = status(str(field(u, "status")));
+        self.toolContent(e, field(u, "content"));
     } else if (std.mem.eql(u8, kind, "tool_call_update")) {
         const e = self.toolEntry(str(field(u, "toolCallId")) orelse return) orelse return;
         if (str(field(u, "status"))) |s| e.status = status(s);
@@ -450,6 +459,7 @@ fn update(self: *Chat, params: json.Value) void {
             e.text.clearRetainingCapacity();
             e.text.appendSlice(self.gpa, t) catch {};
         }
+        self.toolContent(e, field(u, "content"));
     } else if (std.mem.eql(u8, kind, "plan")) {
         // The plan as it stands now: a fresh entry each time, so the conversation shows how it moved.
         const entries = field(u, "entries") orelse return;
@@ -515,6 +525,118 @@ fn cancelPermissions(self: *Chat, send_answer: bool) void {
         if (send_answer) if (e.request) |rid| self.write(acp.writeResult, .{ rid.value(), .{ .outcome = .{ .outcome = "cancelled" } } });
         answer(self.gpa, e, "cancelled");
     }
+}
+
+// ---- files ----------------------------------------------------------------------------------
+
+/// `fs/read_text_file`: a document open in fizzy is read as the editor has it, unsaved edits
+/// included (`text.read`); anything else from disk. `line` (from 1) and `limit` pick lines.
+fn readFile(self: *Chat, id: json.Value, params: json.Value) void {
+    const path = str(field(params, "path")) orelse return self.write(acp.writeError, .{ id, -32602, "no path" });
+    const line: u32 = if (field(params, "line")) |l| (if (l == .integer and l.integer > 0) @intCast(l.integer) else 1) else 1;
+    const limit: u32 = if (field(params, "limit")) |l| (if (l == .integer and l.integer > 0) @intCast(l.integer) else 0) else 0;
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    if (self.host.docFromPath(path) != null) {
+        if (self.callText(arena, "text.read", .{ .path = path, .from_line = line, .to_line = if (limit == 0) 0 else line + limit - 1 })) |zon| {
+            const Read = struct { text: []const u8 };
+            const src = arena.dupeZ(u8, zon) catch "";
+            if (std.zon.parse.fromSliceAlloc(Read, arena, src, null, .{ .ignore_unknown_fields = true })) |r| {
+                return self.write(acp.writeResult, .{ id, .{ .content = r.text } });
+            } else |_| {}
+        }
+    }
+    const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, arena, .limited(64 * 1024 * 1024)) catch |err|
+        return self.write(acp.writeError, .{ id, -32603, @errorName(err) });
+    self.write(acp.writeResult, .{ id, .{ .content = linesOf(bytes, line, limit) } });
+}
+
+/// `fs/write_text_file`: a document open in fizzy takes it as one undoable edit over what
+/// differs (`text.write`), so the person sees it land and can undo it; anything else is written
+/// to disk and opened as a preview tab, so it is seen without tabs piling up.
+fn writeFile(self: *Chat, id: json.Value, params: json.Value) void {
+    const path = str(field(params, "path")) orelse return self.write(acp.writeError, .{ id, -32602, "no path" });
+    const content = str(field(params, "content")) orelse return self.write(acp.writeError, .{ id, -32602, "no content" });
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    if (self.host.docFromPath(path) != null and self.callText(arena, "text.write", .{ .path = path, .text = content }) != null) {
+        return self.write(acp.writeResult, .{ id, .{} });
+    }
+    if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(dvui.io, dir) catch {};
+    std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = content }) catch |err|
+        return self.write(acp.writeError, .{ id, -32603, @errorName(err) });
+    _ = self.host.openFile(.{ .path = path, .mode = .preview }) catch {};
+    self.write(acp.writeResult, .{ id, .{} });
+}
+
+/// Run one of the text plugin's commands with `args`; its result as ZON, or null when there is
+/// no text plugin or it refused.
+fn callText(self: *Chat, arena: std.mem.Allocator, id: []const u8, args: anytype) ?[]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    std.zon.stringify.serialize(args, .{ .whitespace = false }, &out.writer) catch return null;
+    return switch (self.host.callCommand(id, out.written(), arena)) {
+        .ok => |r| r orelse "",
+        else => null,
+    };
+}
+
+/// Lines `line` (from 1) on of `text`, `limit` of them, or all when 0.
+fn linesOf(text: []const u8, line: u32, limit: u32) []const u8 {
+    var start: usize = 0;
+    var n: u32 = 1;
+    while (n < line) : (n += 1) start = (std.mem.indexOfScalarPos(u8, text, start, '\n') orelse return "") + 1;
+    if (limit == 0) return text[start..];
+    var end = start;
+    var taken: u32 = 0;
+    while (taken < limit) : (taken += 1) end = (std.mem.indexOfScalarPos(u8, text, end, '\n') orelse return text[start..]) + 1;
+    return text[start..end];
+}
+
+/// A tool call's content, shown beneath it: a diff as the lines it changes, text as it is.
+fn toolContent(self: *Chat, e: *Entry, content: ?json.Value) void {
+    const items = content orelse return;
+    if (items != .array) return;
+    e.detail.clearRetainingCapacity();
+    for (items.array.items) |item| {
+        const kind = str(field(item, "type")) orelse continue;
+        if (std.mem.eql(u8, kind, "diff")) {
+            diffLines(self.gpa, &e.detail, str(field(item, "path")) orelse "", str(field(item, "oldText")) orelse "", str(field(item, "newText")) orelse "");
+        } else if (std.mem.eql(u8, kind, "content")) {
+            const c = field(item, "content");
+            if (std.mem.eql(u8, str(field(c, "type")) orelse "", "text")) e.detail.appendSlice(self.gpa, str(field(c, "text")) orelse "") catch {};
+        }
+    }
+    self.follow = true;
+}
+
+/// `old` to `new` as the lines that changed: the same lines at the start and the end are left
+/// out, the rest shown `-` then `+`, at most a screenful each.
+fn diffLines(gpa: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), path: []const u8, old: []const u8, new: []const u8) void {
+    var a = std.mem.splitScalar(u8, old, '\n');
+    var b = std.mem.splitScalar(u8, new, '\n');
+    var old_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer old_lines.deinit(gpa);
+    var new_lines: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer new_lines.deinit(gpa);
+    if (old.len > 0) while (a.next()) |l| old_lines.append(gpa, l) catch return;
+    while (b.next()) |l| new_lines.append(gpa, l) catch return;
+    var pre: usize = 0;
+    while (pre < old_lines.items.len and pre < new_lines.items.len and std.mem.eql(u8, old_lines.items[pre], new_lines.items[pre])) pre += 1;
+    var suf: usize = 0;
+    while (suf < old_lines.items.len - pre and suf < new_lines.items.len - pre and
+        std.mem.eql(u8, old_lines.items[old_lines.items.len - 1 - suf], new_lines.items[new_lines.items.len - 1 - suf])) suf += 1;
+    const removed = old_lines.items[pre .. old_lines.items.len - suf];
+    const added = new_lines.items[pre .. new_lines.items.len - suf];
+    const cap = 40;
+    out.print(gpa, "{s}{s}  line {d}\n", .{ if (out.items.len > 0) "\n" else "", std.fs.path.basename(path), pre + 1 }) catch {};
+    for (removed[0..@min(removed.len, cap)]) |l| out.print(gpa, "- {s}\n", .{l}) catch {};
+    if (removed.len > cap) out.print(gpa, "  ... {d} more removed\n", .{removed.len - cap}) catch {};
+    for (added[0..@min(added.len, cap)]) |l| out.print(gpa, "+ {s}\n", .{l}) catch {};
+    if (added.len > cap) out.print(gpa, "  ... {d} more added\n", .{added.len - cap}) catch {};
 }
 
 // ---- the conversation -----------------------------------------------------------------------
@@ -612,7 +734,12 @@ pub fn draw(self: *Chat) !dvui.App.Result {
         for (self.entries.items, 0..) |*e, i| self.drawEntry(e, i, width);
         if (self.follow) {
             self.follow = false;
+            self.follow_frames = 3;
+        }
+        if (self.follow_frames > 0) {
+            self.follow_frames -= 1;
             scroll.si.scrollToOffset(.vertical, std.math.floatMax(f32));
+            dvui.refresh(null, @src(), null);
         }
     }
 
@@ -671,11 +798,23 @@ fn drawEntry(self: *Chat, e: *Entry, i: usize, width: ?f32) void {
                 .completed => "done:",
                 .failed => "failed:",
             };
-            var tl = dvui.textLayout(@src(), .{}, base.override(faded));
-            defer tl.deinit();
-            tl.addText(mark, .{});
-            tl.addText(" ", .{});
-            tl.addText(e.text.items, .{});
+            {
+                var tl = dvui.textLayout(@src(), .{}, base.override(faded));
+                defer tl.deinit();
+                tl.addText(mark, .{});
+                tl.addText(" ", .{});
+                tl.addText(e.text.items, .{});
+            }
+            if (e.detail.items.len > 0) {
+                var tl = dvui.textLayout(@src(), .{}, base.override(.{ .font = theme.font_mono, .id_extra = i + 1_000_000 }));
+                defer tl.deinit();
+                var it = std.mem.splitScalar(u8, std.mem.trimEnd(u8, e.detail.items, "\n"), '\n');
+                while (it.next()) |l| {
+                    const color: ?dvui.Color = if (std.mem.startsWith(u8, l, "+ ")) theme.color(.highlight, .fill) else if (std.mem.startsWith(u8, l, "- ")) theme.color(.err, .text) else null;
+                    tl.addText(l, if (color) |c| .{ .color_text = .{ .color = c } } else .{});
+                    tl.addText("\n", .{});
+                }
+            }
         },
         .permission => {
             var box = dvui.box(@src(), .{ .dir = .vertical }, base.override(.{ .background = true, .corners = .all(6), .color_fill = .{ .color = theme.color(.highlight, .fill).opacity(0.15) } }));

@@ -38,10 +38,14 @@ environment needs fizzy to pass it on, which comes later (the agents plan names 
 - Starts the agent, opens a session in the project folder, and hands it `fizzy-mcp`.
 - Streams the agent's messages and thoughts, its plan, and its tool calls as they run.
 - Asks you before the agent acts when it requests permission, with the agent's own options.
+- Reads files as fizzy's editor has them, unsaved edits included, and writes an open file as one
+  undoable edit in the editor, so you watch it land and can undo it; a file that is not open is
+  written to disk and shown in a preview tab. (The text plugin's `text.read` / `text.write`.)
+- Shows each tool call's diff or output beneath it.
 - Stops a turn (Stop), or the agent (Restart).
 
-Next: the agent's file reads and writes going through fizzy's open documents as undoable edits,
-diffs shown before they land, and terminals.
+Next: terminals through the terminal plugin, several agents to pick from per chat, and resuming
+the agent's own session when a chat is reopened.
 
 ## How it fits together
 
