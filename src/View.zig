@@ -341,7 +341,7 @@ fn drawCode(c: *Chat, key: u64, language: []const u8, text: []const u8, w: f32, 
     {
         var bar = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal });
         defer bar.deinit();
-        dvui.labelNoFmt(@src(), if (language.len > 0) language else "code", .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = faded() }, .font = dvui.themeGet().font_mono });
+        // The fence names its language itself; this bar only offers the copy.
         if (dvui.button(@src(), "Copy", .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .padding = .{ .x = 6, .y = 1, .w = 6, .h = 1 }, .corners = .all(6) })) dvui.clipboardTextSet(text);
     }
     // Fenced and drawn as markdown draws a fence: highlighted by whichever plugin knows the
