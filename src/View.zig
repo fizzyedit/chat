@@ -301,7 +301,7 @@ fn drawThought(c: *Chat, key: u64, text: []const u8, w: f32, thinking: bool, id_
     const open = c.view.open.contains(key);
     var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = id_extra, .margin = .{ .y = 2, .h = 2 } });
     defer box.deinit();
-    if (disclosure(@src(), if (thinking) "Thinking..." else "Thought", entypo.light_bulb, open, id_extra)) {
+    if (disclosure(@src(), if (thinking) "Thinking..." else "Thought", if (thinking) null else entypo.light_bulb, open, id_extra)) {
         if (open) _ = c.view.open.remove(key) else c.view.open.put(c.gpa, key, {}) catch {};
     }
     if (!open) return;
@@ -316,8 +316,9 @@ fn drawThought(c: *Chat, key: u64, text: []const u8, w: f32, thinking: bool, id_
     tl.addText(text, .{});
 }
 
-/// One quiet clickable line: an icon, a label and a chevron. True when clicked.
-fn disclosure(src: std.builtin.SourceLocation, text: []const u8, tvg: []const u8, open: bool, id_extra: usize) bool {
+/// One quiet clickable line: an icon (the boiling spinner when `tvg` is null: still going), a
+/// label and a chevron. True when clicked.
+fn disclosure(src: std.builtin.SourceLocation, text: []const u8, tvg: ?[]const u8, open: bool, id_extra: usize) bool {
     var b: dvui.ButtonWidget = undefined;
     b.init(src, .{}, .{ .id_extra = id_extra, .padding = .{ .y = 2, .h = 2 }, .corners = .all(6), .background = false });
     b.processEvents();
@@ -326,7 +327,9 @@ fn disclosure(src: std.builtin.SourceLocation, text: []const u8, tvg: []const u8
         var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
         defer row.deinit();
         const color = faded();
-        core.icon.icon(@src(), "disclosure-icon", tvg, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
+        if (tvg) |icon| {
+            core.icon.icon(@src(), "disclosure-icon", icon, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
+        } else core.dialogs.bubbleSpinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 14, .h = 14 }, .margin = .{ .w = 6 } }, .{});
         dvui.labelNoFmt(@src(), text, .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = color } });
         core.icon.icon(@src(), "disclosure-chevron", if (open) entypo.chevron_small_down else entypo.chevron_small_right, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } });
     }
@@ -501,7 +504,7 @@ fn drawTool(c: *Chat, tid: api.ToolId, w: f32) void {
             core.icon.icon(@src(), "tool-kind", kindIcon(t.kind), .{ .fill_color = .{ .color = text_color } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 8 } });
             // The status sits at the right edge; the title takes what is left, on one line.
             switch (t.status) {
-                .pending, .running => dvui.spinner(@src(), .{ .gravity_x = 1, .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .color_text = .{ .color = faded() } }),
+                .pending, .running => core.dialogs.bubbleSpinner(@src(), .{ .gravity_x = 1, .gravity_y = 0.5, .min_size_content = .{ .w = 14, .h = 14 } }, .{}),
                 .done => core.icon.icon(@src(), "tool-done", entypo.check, .{ .fill_color = .{ .color = theme.color(.highlight, .fill) } }, .{ .gravity_x = 1, .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } }),
                 .failed => core.icon.icon(@src(), "tool-failed", entypo.cross, .{ .fill_color = .{ .color = theme.color(.err, .text) } }, .{ .gravity_x = 1, .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } }),
             }
@@ -605,19 +608,10 @@ fn drawTyping(c: *Chat, width: f32) void {
     drawDots(c, 0);
 }
 
-/// Three dots, one lit at a time: a timer moves them, so a waiting chat costs three frames a
-/// second, not every frame.
+/// fizzy's spinner, boiling: what a turn that has not said anything yet looks like.
 fn drawDots(c: *Chat, id_extra: usize) void {
     _ = c;
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = id_extra });
-    defer row.deinit();
-    const id = row.data().id;
-    if (dvui.timerDoneOrNone(id)) dvui.timer(id, 330_000);
-    const phase: usize = @intCast(@mod(@divFloor(dvui.frameTimeNS(), 330 * std.time.ns_per_ms), 3));
-    const color = dvui.themeGet().color(.content, .text);
-    for (0..3) |n| {
-        core.icon.icon(@src(), "typing-dot", entypo.dot_single, .{ .fill_color = .{ .color = color.opacity(if (n == phase) 0.9 else 0.3) } }, .{ .id_extra = n, .min_size_content = .{ .w = 10, .h = 10 } });
-    }
+    core.dialogs.bubbleSpinner(@src(), .{ .id_extra = id_extra, .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }, .{});
 }
 
 // ---- the input ------------------------------------------------------------------------------

@@ -26,10 +26,36 @@ var sessions: std.AutoArrayHashMapUnmanaged(api.ChatId, *Session) = .empty;
 const State = enum { idle, starting, ready, prompting, stopped };
 const Pending = enum { initialize, session_new, prompt };
 
+/// An agent starting on a thread of its own: finding the command on the login shell's PATH and
+/// spawning it take seconds the first time, which the UI thread must never wait on.
+const Launch = struct {
+    arena: std.heap.ArenaAllocator,
+    argv: []const []const u8 = &.{},
+    cwd: []const u8 = "",
+    thread: ?std.Thread = null,
+    done: std.atomic.Value(bool) = .init(false),
+    result: Agent.StartError!*Agent = error.SpawnFailed,
+
+    fn run(self: *Launch, gpa: std.mem.Allocator) void {
+        self.result = Agent.start(gpa, dvui.io, self.argv, self.cwd, wake);
+        self.done.store(true, .release);
+        wake();
+    }
+
+    /// Wait for the thread (a chat closed while its agent was starting) and stop what it started.
+    fn abandon(self: *Launch, gpa: std.mem.Allocator) void {
+        if (self.thread) |t| t.join();
+        if (self.result) |a| a.stop() else |_| {}
+        self.arena.deinit();
+        gpa.destroy(self);
+    }
+};
+
 const Session = struct {
     gpa: std.mem.Allocator,
     chat: api.ChatId,
     agent: ?*Agent = null,
+    launch: ?*Launch = null,
     state: State = .idle,
     session_id: ?[]u8 = null,
     next_id: i64 = 1,
@@ -55,6 +81,8 @@ const Session = struct {
     }
 
     fn disconnect(self: *Session) void {
+        if (self.launch) |l| l.abandon(self.gpa);
+        self.launch = null;
         if (self.agent) |a| a.stop();
         self.agent = null;
         self.pending.clearRetainingCapacity();
@@ -163,7 +191,7 @@ fn onSend(a: api.Send) void {
         .starting, .idle, .stopped => {
             if (s.queued) |q| s.gpa.free(q);
             s.queued = s.gpa.dupe(u8, a.text) catch null;
-            if (s.agent == null) connect(s);
+            if (s.agent == null and s.launch == null) connect(s);
         },
     }
 }
@@ -193,6 +221,13 @@ fn onNew(_: api.Empty) void {
 /// What every agent sent since the last frame. Once a frame, from the plugin's `beginFrame`.
 pub fn frame() void {
     for (sessions.values()) |s| frameSession(s);
+}
+
+/// Keep frames coming while an agent starts: its thread wakes the app when it is done, but the
+/// typing indicator wants to move meanwhile.
+pub fn starting() bool {
+    for (sessions.values()) |s| if (s.launch != null) return true;
+    return false;
 }
 
 // ---- talking to the chat --------------------------------------------------------------------
@@ -226,20 +261,44 @@ fn wake() void {
 
 fn connect(s: *Session) void {
     s.disconnect();
-    const arena = sdk.host().arena();
     const line = std.mem.trim(u8, settings.agent_command.get(), " \t");
     if (line.len == 0) return fail(s, "No agent to run. Set one in Settings > Chat: a command line for an agent " ++
         "that speaks the Agent Client Protocol, such as `npx -y @agentclientprotocol/claude-agent-acp`.", .{});
-    const argv = acp.splitCommand(arena, line) catch return fail(s, "Could not read the agent command.", .{});
-    const host = sdk.host();
-    const cwd = host.folder() orelse std.mem.span(std.c.getenv("HOME") orelse "/".ptr);
-    s.agent = Agent.start(s.gpa, dvui.io, argv, cwd, wake) catch |err| switch (err) {
-        error.SpawnFailed => return fail(s, "Could not start `{s}`. Is it installed, and on your shell's PATH?", .{argv[0]}),
-        else => return fail(s, "Could not start the agent: {t}", .{err}),
+    const launch = s.gpa.create(Launch) catch return fail(s, "Could not start the agent: out of memory.", .{});
+    launch.* = .{ .arena = .init(s.gpa) };
+    const arena = launch.arena.allocator();
+    launch.argv = acp.splitCommand(arena, line) catch {
+        launch.abandon(s.gpa);
+        return fail(s, "Could not read the agent command.", .{});
     };
+    const host = sdk.host();
+    launch.cwd = arena.dupe(u8, host.folder() orelse std.mem.span(std.c.getenv("HOME") orelse "/".ptr)) catch "/";
+    launch.thread = std.Thread.spawn(.{}, Launch.run, .{ launch, s.gpa }) catch {
+        launch.abandon(s.gpa);
+        return fail(s, "Could not start the agent: no thread for it.", .{});
+    };
+    s.launch = launch;
     s.state = .starting;
     note(s, "Starting `{s}`...", .{line});
     setBusy(s, true);
+}
+
+/// The agent's launch finished on its thread: on to `initialize`, or say why it did not start.
+fn launched(s: *Session) void {
+    const launch = s.launch orelse return;
+    if (!launch.done.load(.acquire)) return;
+    s.launch = null;
+    if (launch.thread) |t| t.join();
+    launch.thread = null;
+    const argv0 = s.gpa.dupe(u8, if (launch.argv.len > 0) launch.argv[0] else "") catch "";
+    defer if (argv0.len > 0) s.gpa.free(argv0);
+    const result = launch.result;
+    launch.result = error.SpawnFailed; // the agent is the session's now, not the launch's to stop
+    launch.abandon(s.gpa);
+    s.agent = result catch |err| return switch (err) {
+        error.SpawnFailed => fail(s, "Could not start `{s}`. Is it installed, and on your shell's PATH?", .{argv0}),
+        else => fail(s, "Could not start the agent: {t}", .{err}),
+    };
     request(s, .initialize, "initialize", .{
         .protocolVersion = acp.protocol_version,
         // Files go through fizzy's open documents (`readFile`, `writeFile`). Terminals come later.
@@ -326,6 +385,7 @@ fn write(s: *Session, comptime writer: anytype, args: anytype) void {
 // ---- what the agent sends -------------------------------------------------------------------
 
 fn frameSession(s: *Session) void {
+    launched(s);
     const agent = s.agent orelse return;
     var lines: std.ArrayListUnmanaged([]u8) = .empty;
     defer lines.deinit(s.gpa);
