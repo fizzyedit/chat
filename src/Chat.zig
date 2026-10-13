@@ -198,7 +198,7 @@ pub fn send(self: *Chat, text: []const u8) bool {
         self.setTitle(cut);
     }
     self.view.follow = true;
-    Commands.callClient(self.client_id, "chat_send", chat.Send{ .chat = self.chat_id, .text = trimmed });
+    Commands.callClient(self.client_id, "chat_send", chat.Send{ .chat = self.chat_id, .text = trimmed, .folder = self.folder });
     return true;
 }
 

@@ -164,9 +164,14 @@ fn drawTranscript(c: *Chat) void {
     }
     scroll.deinit();
 
-    // The person scrolled (wheel, drag, keys): follow again only at the bottom.
+    // Following stops the moment the person scrolls up from where it was put (a wheel, a drag:
+    // a trackpad's first step is a pixel or two, which a looser test snapped back to the bottom,
+    // so scrolling up rubber-banded), and starts again only once they are back at the bottom.
+    // The Output panel's rule (`OutputPanel.zig`).
     const max_y = @max(0, st.scroll.virtual_size.h - st.scroll.viewport.h);
-    if (@abs(st.scroll.viewport.y - st.set_y) > 0.5) st.follow = st.scroll.viewport.y >= max_y - 4;
+    if (st.follow) {
+        if (st.scroll.viewport.y + 1.0 < st.set_y) st.follow = false;
+    } else st.follow = st.scroll.offsetFromMax(.vertical) < 1.0;
     if (st.follow and st.scroll.viewport.y < max_y - 0.5) dvui.refresh(null, @src(), null);
     // Where the reader is, in messages, for next frame.
     var y: f32 = 10;
@@ -194,15 +199,17 @@ fn streaming(c: *const Chat) bool {
     return last.author == .other and last.parts.items.len > 0;
 }
 
-/// A bubble's tint, from the text colour rather than a control's fill, which in some themes is the
-/// pane's own background: the person's in the highlight, the other side's a light wash.
-fn bubbleFill(person: bool) dvui.Color {
-    const theme = dvui.themeGet();
-    return if (person) theme.color(.highlight, .fill).opacity(0.24) else theme.color(.content, .text).opacity(0.07);
+/// The person's bubble: the content fill, the neutral a step up from the window fill a document
+/// (and so the chat) sits on, which would not show. The other side's replies have no bubble: they
+/// read as the page, the way a document does.
+fn bubbleFill() dvui.Color {
+    return dvui.themeGet().color(.content, .fill);
 }
 
+/// What is around the conversation rather than in it (notes, a done step, a thought): the
+/// control text colour, a step back from the window text the messages are in.
 fn faded() dvui.Color {
-    return dvui.themeGet().color(.content, .text).opacity(0.6);
+    return dvui.themeGet().color(.control, .text);
 }
 
 fn drawHint(c: *Chat, width: f32) void {
@@ -267,8 +274,8 @@ fn drawBubble(c: *Chat, i: usize, m: *Transcript.Message, avail: f32) void {
     var bubble = dvui.box(@src(), .{ .dir = .vertical }, .{
         .gravity_x = if (person) 1 else 0,
         .id_extra = i,
-        .background = true,
-        .color_fill = .{ .color = bubbleFill(person) },
+        .background = person,
+        .color_fill = .{ .color = bubbleFill() },
         .corners = if (person)
             .{ .tl = .round(r), .tr = .round(r), .bl = .round(r), .br = .round(tail) }
         else
@@ -687,7 +694,8 @@ fn drawInput(c: *Chat) void {
         });
         b.processEvents();
         b.drawBackground();
-        core.icon.icon(@src(), "send", if (busy) entypo.controller_stop else entypo.paper_plane, .{ .fill_color = .{ .color = theme.color(.content, .text) } }, .{ .min_size_content = .{ .w = 16, .h = 16 } });
+        // On the highlight, the icon takes the content's fill, as text on a highlighted control would.
+        core.icon.icon(@src(), "send", if (busy) entypo.controller_stop else entypo.paper_plane, .{ .fill_color = .{ .color = if (busy) theme.color(.content, .text) else theme.color(.content, .fill) } }, .{ .min_size_content = .{ .w = 16, .h = 16 } });
         const clicked = b.clicked();
         b.deinit();
         if (clicked) {

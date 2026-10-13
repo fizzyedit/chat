@@ -17,7 +17,7 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
     inline for (.{
         .{ "chat_send", api.Send, onSend },
         .{ "chat_answer", api.Answer, onAnswer },
-        .{ "chat_new", api.Empty, onNew },
+        .{ "chat_new", api.NewChat, onNew },
     }) |entry| try host.registerCommand(.{
         .id = client_id ++ "." ++ entry[0],
         .owner = owner,
@@ -59,7 +59,7 @@ fn runSample(_: *anyopaque) anyerror!void {
     onNew(.{});
 }
 
-fn onNew(_: api.Empty) void {
+fn onNew(_: api.NewChat) void {
     const r = call("chat.open", api.Open{ .client = client_id, .title = "Sample chat" }) orelse return;
     const opened = api.parse(api.Opened, sdk.host().arena(), r) catch return;
     _ = call("chat.post", api.Post{ .chat = opened.chat, .blocks = &.{

@@ -147,8 +147,11 @@ fn finish(self: *Agent) void {
 
 fn readStderr(self: *Agent) void {
     const stderr = self.child.stderr orelse return;
+    // The reader's own buffer, and a separate one to read into: one buffer for both had the
+    // reader copy it onto itself (`@memcpy arguments alias`) once enough arrived at once.
+    var read_buf: [1024]u8 = undefined;
     var buf: [1024]u8 = undefined;
-    var r = stderr.readerStreaming(self.io, &buf);
+    var r = stderr.readerStreaming(self.io, &read_buf);
     while (true) {
         const n = r.interface.readSliceShort(&buf) catch return;
         if (n == 0) return;

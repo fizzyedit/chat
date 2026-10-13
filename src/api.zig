@@ -14,8 +14,8 @@
 //! `{ chat }`.
 //!
 //! **What the chat calls on a client**, `<client>.<name>`, when the client registered it:
-//! `chat_send` `{ chat, text }`, `chat_answer` `{ chat, question, option }`, `chat_cancel`
-//! `{ chat }`, `chat_closed` `{ chat }`, `chat_resume` `{ chat, state }`, `chat_new` `{}`.
+//! `chat_send` `{ chat, text, folder }`, `chat_answer` `{ chat, question, option }`, `chat_cancel`
+//! `{ chat }`, `chat_closed` `{ chat }`, `chat_resume` `{ chat, state }`, `chat_new` `{ folder }`.
 const std = @import("std");
 
 /// The contract's version, which `chat.register` names.
@@ -117,7 +117,12 @@ pub const TextKind = enum(u8) { text, thought };
 
 pub const Register = struct { client: []const u8, title: []const u8, version: u32 = version };
 pub const Unregister = struct { client: []const u8 };
-pub const Open = struct { client: []const u8, title: []const u8 = "" };
+pub const Open = struct {
+    client: []const u8,
+    title: []const u8 = "",
+    /// The project folder the chat is about; empty: the one fizzy has open.
+    folder: []const u8 = "",
+};
 pub const Opened = struct { chat: ChatId };
 pub const Post = struct { chat: ChatId, author: Author = .other, blocks: []const Block = &.{} };
 pub const Posted = struct { message: MessageId };
@@ -135,13 +140,20 @@ pub const SetResume = struct { chat: ChatId, state: []const u8 };
 pub const Focus = struct { chat: ChatId };
 
 /// To a client.
-pub const Send = struct { chat: ChatId, text: []const u8 };
+pub const Send = struct {
+    chat: ChatId,
+    text: []const u8,
+    /// The project folder the chat is about (an agent works there); empty for none.
+    folder: []const u8 = "",
+};
 pub const Answer = struct { chat: ChatId, question: QuestionId, option: []const u8 };
 pub const ChatOnly = struct { chat: ChatId };
 pub const Resume = struct { chat: ChatId, state: []const u8 };
 pub const Resumed = struct { resumed: bool };
-/// A command that takes nothing (`chat_new`).
+/// A command that takes nothing.
 pub const Empty = struct {};
+/// New, from the list: in this folder, when it was a folder's +; empty for the one fizzy has open.
+pub const NewChat = struct { folder: []const u8 = "" };
 
 /// Parse a command's arguments, in `arena`.
 pub fn parse(comptime T: type, arena: std.mem.Allocator, zon: []const u8) !T {

@@ -199,7 +199,7 @@ fn cmdOpen(a: api.Open, call: *sdk.Command.Call) !void {
     if (!isRegistered(a.client)) return call.fail("{s} is not registered (chat.register)", .{a.client});
     const host = sdk.host();
     const gpa = sdk.allocator();
-    const path = try Explorer.newPath(host, a.client);
+    const path = try Explorer.newPath(host, a.client, a.folder);
     defer host.allocator.free(path);
     // The chat exists from now: what the client posts before fizzy has opened its document waits
     // here, and the document adopts it.

@@ -24,7 +24,7 @@ pub var settings: *const Settings = undefined;
 var sessions: std.AutoArrayHashMapUnmanaged(api.ChatId, *Session) = .empty;
 
 const State = enum { idle, starting, ready, prompting, stopped };
-const Pending = enum { initialize, session_new, prompt };
+const Pending = enum { initialize, session_new, session_resume, session_load, prompt };
 
 /// An agent starting on a thread of its own: finding the command on the login shell's PATH and
 /// spawning it take seconds the first time, which the UI thread must never wait on.
@@ -62,7 +62,19 @@ const Session = struct {
     pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
     /// What the person sent before the agent was ready: sent once the session opens.
     queued: ?[]u8 = null,
+    /// The chat's project folder, where the agent works; empty: the one fizzy has open.
+    folder: ?[]u8 = null,
     has_mcp: bool = false,
+    /// The agent session this chat had (what it saved with `chat.set_resume`), to pick up again
+    /// rather than start over: the agent keeps its own memory of the conversation.
+    resume_id: ?[]u8 = null,
+    /// What `initialize` said the agent can do about an earlier session: continue it as it is
+    /// (`session/resume`), or load it, replaying its history (`session/load`).
+    can_resume: bool = false,
+    can_load: bool = false,
+    /// A `session/load` is replaying the conversation: the chat has it already, so the replay is
+    /// not shown again.
+    replaying: bool = false,
     /// This turn's message, made when the agent first says or does something in it.
     turn: ?api.MessageId = null,
     /// The agent's `toolCallId`s and the steps they are in the chat; hidden ones map to null.
@@ -73,6 +85,8 @@ const Session = struct {
     fn deinit(self: *Session) void {
         self.disconnect();
         if (self.queued) |q| self.gpa.free(q);
+        if (self.resume_id) |r| self.gpa.free(r);
+        if (self.folder) |f| self.gpa.free(f);
         self.pending.deinit(self.gpa);
         var it = self.tools.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
@@ -126,7 +140,8 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
         .{ "chat_answer", api.Answer, onAnswer },
         .{ "chat_cancel", api.ChatOnly, onCancel },
         .{ "chat_closed", api.ChatOnly, onClosed },
-        .{ "chat_new", api.Empty, onNew },
+        .{ "chat_resume", api.Resume, onResume },
+        .{ "chat_new", api.NewChat, onNew },
     }) |entry| try host.registerCommand(.{
         .id = client_id ++ "." ++ entry[0],
         .owner = owner,
@@ -185,6 +200,7 @@ fn sessionFor(chat: api.ChatId) ?*Session {
 
 fn onSend(a: api.Send) void {
     const s = sessionFor(a.chat) orelse return;
+    if (s.folder == null and a.folder.len > 0) s.folder = s.gpa.dupe(u8, a.folder) catch null;
     switch (s.state) {
         .ready => prompt(s, a.text),
         .prompting => {},
@@ -208,14 +224,23 @@ fn onCancel(a: api.ChatOnly) void {
     cancel(s);
 }
 
+/// A chat of ours opened again (a restart, its tab reopened, this plugin reloaded), with the agent
+/// session it had: the next message continues that session instead of starting one.
+fn onResume(a: api.Resume) void {
+    const s = sessionFor(a.chat) orelse return;
+    if (s.agent != null or s.launch != null) return;
+    if (s.resume_id) |r| s.gpa.free(r);
+    s.resume_id = s.gpa.dupe(u8, a.state) catch null;
+}
+
 fn onClosed(a: api.ChatOnly) void {
     const kv = sessions.fetchSwapRemove(a.chat) orelse return;
     kv.value.deinit();
     sdk.allocator().destroy(kv.value);
 }
 
-fn onNew(_: api.Empty) void {
-    _ = call("chat.open", api.Open{ .client = client_id });
+fn onNew(a: api.NewChat) void {
+    _ = call("chat.open", api.Open{ .client = client_id, .folder = a.folder });
 }
 
 /// What every agent sent since the last frame. Once a frame, from the plugin's `beginFrame`.
@@ -271,15 +296,16 @@ fn connect(s: *Session) void {
         launch.abandon(s.gpa);
         return fail(s, "Could not read the agent command.", .{});
     };
-    const host = sdk.host();
-    launch.cwd = arena.dupe(u8, host.folder() orelse std.mem.span(std.c.getenv("HOME") orelse "/".ptr)) catch "/";
+    launch.cwd = arena.dupe(u8, workDir(s)) catch "/";
     launch.thread = std.Thread.spawn(.{}, Launch.run, .{ launch, s.gpa }) catch {
         launch.abandon(s.gpa);
         return fail(s, "Could not start the agent: no thread for it.", .{});
     };
     s.launch = launch;
     s.state = .starting;
-    note(s, "Starting `{s}`...", .{line});
+    // Picking a session back up says so when it is open ("Picked up where you left off"); only a
+    // new one is worth announcing as it starts.
+    if (s.resume_id == null) note(s, "Starting `{s}`...", .{line});
     setBusy(s, true);
 }
 
@@ -307,6 +333,12 @@ fn launched(s: *Session) void {
     });
 }
 
+/// Where the agent works: the chat's folder, else the one fizzy has open, else home.
+fn workDir(s: *const Session) []const u8 {
+    if (s.folder) |f| return f;
+    return sdk.host().folder() orelse std.mem.span(std.c.getenv("HOME") orelse "/".ptr);
+}
+
 fn fail(s: *Session, comptime fmt: []const u8, args: anytype) void {
     note(s, fmt, args);
     if (s.state == .starting or s.state == .idle) setBusy(s, false);
@@ -329,8 +361,32 @@ fn openSession(s: *Session) void {
         }
     } else note(s, "fizzy-mcp was not found, so the agent cannot see or drive fizzy. Install the agent plugin, " ++
         "or name fizzy-mcp in Settings > Chat.", .{});
-    const cwd = host.folder() orelse std.mem.span(std.c.getenv("HOME") orelse "/".ptr);
+    const cwd = workDir(s);
+    // Pick up the session this chat had, when the agent can: continuing it as it is if it can,
+    // else loading it (its history replays, and is not shown twice).
+    if (s.resume_id) |id| {
+        if (s.can_resume) return request(s, .session_resume, "session/resume", .{ .sessionId = id, .cwd = cwd, .mcpServers = servers });
+        if (s.can_load) {
+            s.replaying = true;
+            return request(s, .session_load, "session/load", .{ .sessionId = id, .cwd = cwd, .mcpServers = servers });
+        }
+    }
     request(s, .session_new, "session/new", .{ .cwd = cwd, .mcpServers = servers });
+}
+
+/// The session is open (new, resumed or loaded): send what was waiting.
+fn sessionOpen(s: *Session, id: []const u8, how: []const u8) void {
+    if (s.session_id) |old| s.gpa.free(old);
+    s.session_id = s.gpa.dupe(u8, id) catch null;
+    _ = call("chat.set_resume", api.SetResume{ .chat = s.chat, .state = id });
+    s.state = .ready;
+    s.replaying = false;
+    if (s.has_mcp) note(s, "{s} The agent can see and drive fizzy.", .{how}) else note(s, "{s}", .{how});
+    if (s.queued) |q| {
+        s.queued = null;
+        defer s.gpa.free(q);
+        prompt(s, q);
+    } else setBusy(s, false);
 }
 
 /// The setting's fizzy-mcp, else the one beside the agent plugin.
@@ -430,19 +486,18 @@ fn handle(s: *Session, msg: acp.Inbound) void {
 
 fn answered(s: *Session, what: Pending, result: json.Value) void {
     switch (what) {
-        .initialize => openSession(s),
+        .initialize => {
+            const caps = field(result, "agentCapabilities");
+            s.can_load = if (field(caps, "loadSession")) |v| v == .bool and v.bool else false;
+            s.can_resume = field(field(caps, "sessionCapabilities"), "resume") != null;
+            openSession(s);
+        },
         .session_new => {
             const id = str(field(result, "sessionId")) orelse return fail(s, "The agent opened no session.", .{});
-            s.session_id = s.gpa.dupe(u8, id) catch null;
-            _ = call("chat.set_resume", api.SetResume{ .chat = s.chat, .state = id });
-            s.state = .ready;
-            if (s.has_mcp) note(s, "Connected. The agent can see and drive fizzy.", .{}) else note(s, "Connected.", .{});
-            if (s.queued) |q| {
-                s.queued = null;
-                defer s.gpa.free(q);
-                prompt(s, q);
-            } else setBusy(s, false);
+            sessionOpen(s, id, "Connected.");
         },
+        // A resumed or loaded session keeps its id; the answer may not repeat it.
+        .session_resume, .session_load => sessionOpen(s, s.resume_id orelse "", "Picked up where you left off."),
         .prompt => {
             s.state = .ready;
             s.turn = null;
@@ -456,6 +511,15 @@ fn answered(s: *Session, what: Pending, result: json.Value) void {
 
 fn refused(s: *Session, what: Pending, err: []const u8) void {
     switch (what) {
+        .session_resume, .session_load => {
+            // The agent no longer has it (another machine, cleared, too old): start over, and say
+            // so, since it will not remember what came before.
+            note(s, "The agent could not pick up where this left off ({s}). Starting a new session: it will not remember what came before.", .{err});
+            s.replaying = false;
+            if (s.resume_id) |r| s.gpa.free(r);
+            s.resume_id = null;
+            openSession(s);
+        },
         .initialize, .session_new => {
             // An agent that needs signing in says so here: its own CLI does that, once.
             note(s, "The agent refused to start: {s}", .{err});
@@ -472,6 +536,8 @@ fn refused(s: *Session, what: Pending, err: []const u8) void {
 
 /// `session/update`: what the agent is saying, thinking and doing.
 fn update(s: *Session, params: json.Value) void {
+    // A loaded session replays its history first: the chat shows it already.
+    if (s.replaying) return;
     const u = field(params, "update") orelse return;
     const kind = str(field(u, "sessionUpdate")) orelse return;
     if (std.mem.eql(u8, kind, "agent_message_chunk")) {

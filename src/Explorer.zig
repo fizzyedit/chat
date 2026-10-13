@@ -15,6 +15,7 @@ const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const core = @import("core");
 const Commands = @import("Commands.zig");
+const api = @import("api.zig");
 
 const Row = struct {
     client: []u8,
@@ -39,6 +40,11 @@ pub fn changed() void {
 pub fn deinit(gpa: std.mem.Allocator) void {
     clear(gpa);
     rows.deinit(gpa);
+    for (pluses.items) |p| {
+        gpa.free(p.client);
+        gpa.free(p.folder);
+    }
+    pluses.deinit(gpa);
 }
 
 fn clear(gpa: std.mem.Allocator) void {
@@ -58,14 +64,15 @@ pub fn dir(host: *sdk.Host, gpa: std.mem.Allocator) ?[]u8 {
     return std.fs.path.join(gpa, &.{ config, "chats" }) catch null;
 }
 
-/// A new, empty transcript of `client`'s, written so it opens as theirs. Owned by `host.allocator`.
-pub fn newPath(host: *sdk.Host, client: []const u8) ![]u8 {
+/// A new, empty transcript of `client`'s, written so it opens as theirs, about `folder` (empty:
+/// the one fizzy has open). Owned by `host.allocator`.
+pub fn newPath(host: *sdk.Host, client: []const u8, folder: []const u8) ![]u8 {
     const gpa = host.allocator;
     const chats = dir(host, gpa) orelse return error.NoConfigFolder;
     defer gpa.free(chats);
-    const folder = try std.fs.path.join(gpa, &.{ chats, client });
-    defer gpa.free(folder);
-    std.Io.Dir.cwd().createDirPath(dvui.io, folder) catch {};
+    const client_dir = try std.fs.path.join(gpa, &.{ chats, client });
+    defer gpa.free(client_dir);
+    std.Io.Dir.cwd().createDirPath(dvui.io, client_dir) catch {};
     // Named by when it began, so names sort as the chats do and never collide in practice.
     const now = std.Io.Clock.real.now(dvui.io).toSeconds();
     const day = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
@@ -79,14 +86,14 @@ pub fn newPath(host: *sdk.Host, client: []const u8) ![]u8 {
             ymd.year, md.month.numeric(), md.day_index + 1, t.getHoursIntoDay(), t.getMinutesIntoHour(), t.getSecondsIntoMinute(),
             if (n == 0) "" else try std.fmt.bufPrint(name_buf[48..], "-{d}", .{n}),
         });
-        const p = try std.fs.path.join(gpa, &.{ folder, name });
+        const p = try std.fs.path.join(gpa, &.{ client_dir, name });
         std.Io.Dir.cwd().access(dvui.io, p, .{}) catch break p;
         gpa.free(p);
     };
     errdefer gpa.free(path);
     var head: std.Io.Writer.Allocating = .init(gpa);
     defer head.deinit();
-    const project = host.folder() orelse "";
+    const project = if (folder.len > 0) folder else host.folder() orelse "";
     try head.writer.print("// \n// folder {s}\n", .{project});
     try std.zon.stringify.serialize(.{ .version = @as(u32, 2), .client = client, .folder = project }, .{}, &head.writer);
     try head.writer.writeByte('\n');
@@ -217,17 +224,18 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
 
     const active: []const u8 = if (host.activeDoc()) |doc| doc.owner.documentPath(doc) else "";
     const open_folder = host.folder() orelse "";
+    claimPluses(host);
     var tree = core.widgets.TreeWidget.tree(@src(), .{}, .{ .background = false, .expand = .horizontal });
     defer tree.deinit();
 
     for (clients.items) |client| {
         const live = Commands.isRegistered(client);
         const color = theme.color(.control, .text).opacity(if (live) 1 else 0.5);
-        const branch = groupBranch(tree, client, "", true, color, Commands.clientTitle(client) orelse client, null);
+        const branch = groupBranch(tree, client, "", true, color, Commands.clientTitle(client) orelse client, null, if (live) "" else null);
         defer branch.deinit();
         if (!branch.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal })) continue;
 
-        if (live) newChatRow(host, tree, client) else {
+        if (!live) {
             var note = dvui.textLayout(@src(), .{}, .{ .background = false, .margin = .{ .x = indent }, .color_text = .{ .color = color }, .max_size_content = .width(@max(width - 40, 40)) });
             note.format("Needs the {s} plugin to continue these.", .{client}, .{});
             note.deinit();
@@ -244,7 +252,7 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
                 if (std.mem.eql(u8, r.client, client) and std.mem.eql(u8, r.folder, folder) and std.mem.eql(u8, r.path, active)) holds_active = true;
             }
             const name = if (folder.len > 0) std.fs.path.basename(folder) else "No folder";
-            const fb = groupBranch(tree, client, folder, holds_active or std.mem.eql(u8, folder, open_folder) or folders.items.len == 1, color, name, dvui.entypo.folder);
+            const fb = groupBranch(tree, client, folder, holds_active or std.mem.eql(u8, folder, open_folder) or folders.items.len == 1, color, name, dvui.entypo.folder, if (live) folder else null);
             defer fb.deinit();
             if (!fb.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal })) continue;
             for (rows.items) |r| {
@@ -284,8 +292,43 @@ fn rowOptions(id: usize, selected: bool) dvui.Options {
     };
 }
 
-/// A group's row: a client, or a folder under one. Its caret, its icon, its name.
-fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: []const u8, expanded: bool, color: dvui.Color, name: []const u8, icon: ?[]const u8) *core.widgets.TreeWidget.Branch {
+/// A + at a group row's right edge, as drawn last frame, and the chat it makes.
+const Plus = struct { rect: dvui.Rect.Physical, client: []u8, folder: []u8, id: usize };
+var pluses: std.ArrayListUnmanaged(Plus) = .empty;
+/// The + the pointer is over, by row id.
+var plus_hot: ?usize = null;
+
+/// Clicks on a row's +, taken before the row's own button sees them (a press there would fold the
+/// group): by where each + was drawn last frame. Then the list is drawn afresh.
+fn claimPluses(host: *sdk.Host) void {
+    const gpa = host.allocator;
+    const mp = dvui.currentWindow().mouse_pt;
+    plus_hot = null;
+    for (pluses.items) |p| if (p.rect.contains(mp)) {
+        plus_hot = p.id;
+    };
+    var made: ?usize = null;
+    for (dvui.events()) |*e| {
+        if (e.handled or e.evt != .mouse) continue;
+        const me = e.evt.mouse;
+        if (!me.button.pointer() or (me.action != .press and me.action != .release)) continue;
+        for (pluses.items, 0..) |p, i| if (p.rect.contains(me.p)) {
+            e.handled = true;
+            if (me.action == .release) made = i;
+            break;
+        };
+    }
+    if (made) |i| newChat(host, pluses.items[i].client, pluses.items[i].folder);
+    for (pluses.items) |p| {
+        gpa.free(p.client);
+        gpa.free(p.folder);
+    }
+    pluses.clearRetainingCapacity();
+}
+
+/// A group's row: a client, or a folder under one. Its caret, its icon, its name, and a + at the
+/// right edge (`plus`: the folder a new chat goes in, "" for the open one; null for none).
+fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: []const u8, expanded: bool, color: dvui.Color, name: []const u8, icon: ?[]const u8, plus: ?[]const u8) *core.widgets.TreeWidget.Branch {
     const id = idOf(&.{ client, folder, "group" });
     const branch = tree.branch(@src(), .{
         .expanded = expanded,
@@ -296,6 +339,30 @@ fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: []con
         .branch_id = id,
     }, rowOptions(id, false));
     core.widgets.treeCaret(@src(), branch.expanded, color);
+    if (plus) |plus_folder| {
+        const theme = dvui.themeGet();
+        var box = dvui.box(@src(), .{}, .{
+            .gravity_x = 1,
+            .gravity_y = 0.5,
+            .margin = .{ .w = 4 },
+            .padding = .all(3),
+            .corners = .all(6),
+            .background = plus_hot == id,
+            .color_fill = .{ .color = theme.color(.control, .fill_hover) },
+        });
+        core.icon.icon(@src(), "chat-plus", dvui.entypo.plus, .{ .fill_color = .{ .color = if (plus_hot == id) theme.color(.highlight, .fill) else color } }, .{ .min_size_content = .{ .w = 12, .h = 12 } });
+        const r = box.data().borderRectScale().r;
+        box.deinit();
+        const gpa = sdk.allocator();
+        if (gpa.dupe(u8, client)) |c| {
+            if (gpa.dupe(u8, plus_folder)) |f| {
+                pluses.append(gpa, .{ .rect = r, .client = c, .folder = f, .id = id }) catch {
+                    gpa.free(c);
+                    gpa.free(f);
+                };
+            } else |_| gpa.free(c);
+        } else |_| {}
+    }
     if (icon) |tvg| {
         var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
         core.icon.icon(@src(), "chat-group", tvg, .{ .fill_color = .{ .color = color } }, core.widgets.treeRowIconOptions(.{}));
@@ -307,24 +374,6 @@ fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: []con
         .font = if (icon == null) dvui.themeGet().font_body.withWeight(.bold) else null,
     });
     return branch;
-}
-
-fn newChatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, client: []const u8) void {
-    const theme = dvui.themeGet();
-    const id = idOf(&.{ client, "new" });
-    const branch = tree.branch(@src(), .{ .can_accept_children = false, .draggable = false, .branch_id = id }, rowOptions(id, false));
-    defer branch.deinit();
-    {
-        var slot = core.widgets.treeRowGlyph(@src(), .{});
-        slot.deinit();
-    }
-    {
-        var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
-        core.icon.icon(@src(), "chat-new", dvui.entypo.plus, .{ .fill_color = .{ .color = theme.color(.highlight, .fill) } }, core.widgets.treeRowIconOptions(.{}));
-        slot.deinit();
-    }
-    dvui.labelNoFmt(@src(), "New chat", .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = theme.color(.highlight, .fill) } });
-    if (branch.button.clicked()) newChat(host, client);
 }
 
 fn chatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, r: Row, selected: bool, width: f32) void {
@@ -360,16 +409,17 @@ fn age(arena: std.mem.Allocator, modified: i64) []const u8 {
     return std.fmt.allocPrint(arena, "{d}{s}", .{ v, unit }) catch "";
 }
 
-/// New, for `client`: its own `chat_new` when it has one (it may want to set the chat up), else a
-/// plain new chat of its.
-fn newChat(host: *sdk.Host, client: []const u8) void {
+/// New, for `client`, in `folder` (empty: the one fizzy has open): its own `chat_new` when it has
+/// one (it may want to set the chat up), else a plain new chat of its.
+fn newChat(host: *sdk.Host, client: []const u8, folder: []const u8) void {
     var buf: [128]u8 = undefined;
     const id = std.fmt.bufPrint(&buf, "{s}.chat_new", .{client}) catch return;
     if (host.command(id) != null) {
-        _ = host.callCommand(id, ".{}", host.arena());
+        const args = api.write(host.arena(), api.NewChat{ .folder = folder }) catch return;
+        _ = host.callCommand(id, args, host.arena());
         return;
     }
-    const path = newPath(host, client) catch |err| return dvui.log.err("chat: could not start a new chat: {t}", .{err});
+    const path = newPath(host, client, folder) catch |err| return dvui.log.err("chat: could not start a new chat: {t}", .{err});
     defer host.allocator.free(path);
     _ = host.openFile(.{ .path = path }) catch {};
 }
