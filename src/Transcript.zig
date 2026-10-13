@@ -341,6 +341,8 @@ pub const Saved = struct {
     version: u32 = format_version,
     client: []const u8 = "",
     title: []const u8 = "",
+    /// The project folder the chat was started in, by which the list groups it; empty for none.
+    folder: []const u8 = "",
     @"resume": []const u8 = "",
     messages: []const SavedMessage = &.{},
     tools: []const SavedTool = &.{},
@@ -377,7 +379,7 @@ const SavedQuestion = struct {
     chosen: ?u32 = null,
 };
 
-pub const Header = struct { client: []const u8, title: []const u8, @"resume": []const u8 };
+pub const Header = struct { client: []const u8, title: []const u8, folder: []const u8 = "", @"resume": []const u8 };
 
 /// Write the transcript to `w`, and its images into `images_dir` (each once, by hash).
 pub fn save(self: *const Transcript, w: *std.Io.Writer, header: Header, images_dir: []const u8, io: std.Io) !void {
@@ -409,11 +411,13 @@ pub fn save(self: *const Transcript, w: *std.Io.Writer, header: Header, images_d
             else => null,
         } };
     }
+    // The first two lines are what the list reads (`Explorer`): the title, then the folder.
     const title = header.title;
-    try w.print("// {s}\n", .{title[0 .. std.mem.indexOfScalar(u8, title, '\n') orelse title.len]});
+    try w.print("// {s}\n// folder {s}\n", .{ title[0 .. std.mem.indexOfScalar(u8, title, '\n') orelse title.len], header.folder });
     try std.zon.stringify.serialize(Saved{
         .client = header.client,
         .title = header.title,
+        .folder = header.folder,
         .@"resume" = header.@"resume",
         .messages = messages,
         .tools = tools,
@@ -453,7 +457,7 @@ fn extensionOf(mime: []const u8) []const u8 {
 }
 
 /// What `load` found in the header: owned by the caller's allocator.
-pub const Loaded = struct { client: []u8, title: []u8, @"resume": []u8 };
+pub const Loaded = struct { client: []u8, title: []u8, folder: []u8, @"resume": []u8 };
 
 /// Read a transcript `save` wrote (or the first version's, converted). Images are read back from
 /// `images_dir`; one that is missing is left out.
@@ -499,6 +503,7 @@ pub fn load(self: *Transcript, bytes: []const u8, images_dir: []const u8, io: st
     return .{
         .client = try self.gpa.dupe(u8, saved.client),
         .title = try self.gpa.dupe(u8, saved.title),
+        .folder = try self.gpa.dupe(u8, saved.folder),
         .@"resume" = try self.gpa.dupe(u8, saved.@"resume"),
     };
 }
@@ -581,7 +586,7 @@ fn loadV1(self: *Transcript, arena: std.mem.Allocator, source: [:0]const u8) !Lo
             }
         },
     };
-    return .{ .client = try self.gpa.dupe(u8, "agent"), .title = try self.gpa.dupe(u8, old.title), .@"resume" = try self.gpa.dupe(u8, "") };
+    return .{ .client = try self.gpa.dupe(u8, "agent"), .title = try self.gpa.dupe(u8, old.title), .folder = try self.gpa.dupe(u8, ""), .@"resume" = try self.gpa.dupe(u8, "") };
 }
 
 test "a transcript saves and loads back as it was" {
@@ -606,8 +611,8 @@ test "a transcript saves and loads back as it was" {
 
     var out: std.Io.Writer.Allocating = .init(gpa);
     defer out.deinit();
-    try t.save(&out.writer, .{ .client = "sample", .title = "Hello?", .@"resume" = "session-1" }, "unused-images", io);
-    try std.testing.expect(std.mem.startsWith(u8, out.written(), "// Hello?\n"));
+    try t.save(&out.writer, .{ .client = "sample", .title = "Hello?", .folder = "/p", .@"resume" = "session-1" }, "unused-images", io);
+    try std.testing.expect(std.mem.startsWith(u8, out.written(), "// Hello?\n// folder /p\n"));
 
     var back: Transcript = .{ .gpa = gpa };
     defer back.deinit();
@@ -615,10 +620,12 @@ test "a transcript saves and loads back as it was" {
     defer {
         gpa.free(h.client);
         gpa.free(h.title);
+        gpa.free(h.folder);
         gpa.free(h.@"resume");
     }
     try std.testing.expectEqualStrings("sample", h.client);
     try std.testing.expectEqualStrings("session-1", h.@"resume");
+    try std.testing.expectEqualStrings("/p", h.folder);
     try std.testing.expectEqual(@as(usize, 2), back.messages.items.len);
     const parts = back.messages.items[1].parts.items;
     try std.testing.expectEqualStrings("Thinking.", parts[0].block.thought.items);
@@ -645,6 +652,7 @@ test "a first-version transcript reads as messages" {
     defer {
         gpa.free(h.client);
         gpa.free(h.title);
+        gpa.free(h.folder);
         gpa.free(h.@"resume");
     }
     try std.testing.expectEqualStrings("agent", h.client);

@@ -1,6 +1,8 @@
-//! The chats, in the sidebar, grouped by the client each belongs to (plans/CHAT_PLAN.md): a
-//! group per client, its title and a New button, then its conversations, newest first. Choosing
-//! one opens it in a tab (`Host.openFile`), where `View.zig` draws it like any document.
+//! The chats, in the sidebar, as a tree (plans/CHAT_PLAN.md): who each is with (the client: the
+//! agents, a person), then the project folder it was started in, then the conversations, newest
+//! first, each group ordered by its newest. Choosing one opens it in a tab (`Host.openFile`),
+//! where `View.zig` draws it like any document. No background of its own: the sidebar shows
+//! through, as it does behind the file tree.
 //!
 //! Chats live in `<config>/chats/<client>/`, beside fizzy's plugins directory: a plugin has no
 //! data directory of its own yet (the seam: `Host.pluginDataDir(id)`), and its install directory
@@ -18,6 +20,8 @@ const Row = struct {
     client: []u8,
     path: []u8,
     title: []u8,
+    /// The project folder the chat was started in; empty for none.
+    folder: []u8,
     /// Seconds since the epoch, for ordering.
     modified: i64,
 };
@@ -42,6 +46,7 @@ fn clear(gpa: std.mem.Allocator) void {
         gpa.free(r.client);
         gpa.free(r.path);
         gpa.free(r.title);
+        gpa.free(r.folder);
     }
     rows.clearRetainingCapacity();
 }
@@ -81,8 +86,9 @@ pub fn newPath(host: *sdk.Host, client: []const u8) ![]u8 {
     errdefer gpa.free(path);
     var head: std.Io.Writer.Allocating = .init(gpa);
     defer head.deinit();
-    try head.writer.writeAll("// \n");
-    try std.zon.stringify.serialize(.{ .version = @as(u32, 2), .client = client }, .{}, &head.writer);
+    const project = host.folder() orelse "";
+    try head.writer.print("// \n// folder {s}\n", .{project});
+    try std.zon.stringify.serialize(.{ .version = @as(u32, 2), .client = client, .folder = project }, .{}, &head.writer);
     try head.writer.writeByte('\n');
     try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = head.written() });
     changed();
@@ -137,14 +143,18 @@ fn scan(host: *sdk.Host) void {
                 gpa.free(path);
                 continue;
             };
+            const head = readHead(gpa, d, entry.name);
             rows.append(gpa, .{
                 .client = client,
                 .path = path,
-                .title = readTitle(gpa, d, entry.name) catch gpa.dupe(u8, "") catch "",
+                .title = head.title,
+                .folder = head.folder,
                 .modified = @intCast(@divFloor(stat.mtime.nanoseconds, std.time.ns_per_s)),
             }) catch {
                 gpa.free(path);
                 gpa.free(client);
+                gpa.free(head.title);
+                gpa.free(head.folder);
             };
         }
     }
@@ -155,15 +165,23 @@ fn scan(host: *sdk.Host) void {
     }.newer);
 }
 
-/// A transcript's first line, `// <title>` (`Transcript.save`).
-fn readTitle(gpa: std.mem.Allocator, d: std.Io.Dir, name: []const u8) ![]u8 {
-    var file = try d.openFile(dvui.io, name, .{});
-    defer file.close(dvui.io);
-    var buf: [256]u8 = undefined;
-    const n = try file.readPositional(dvui.io, &.{&buf}, 0);
-    const first = buf[0 .. std.mem.indexOfScalar(u8, buf[0..n], '\n') orelse n];
+const Head = struct { title: []u8, folder: []u8 };
+
+/// A transcript's first two lines (`Transcript.save`): `// <title>`, then `// folder <path>`,
+/// which a first-version transcript does not have.
+fn readHead(gpa: std.mem.Allocator, d: std.Io.Dir, name: []const u8) Head {
+    var buf: [1024]u8 = undefined;
+    const n = blk: {
+        var file = d.openFile(dvui.io, name, .{}) catch break :blk 0;
+        defer file.close(dvui.io);
+        break :blk file.readPositional(dvui.io, &.{&buf}, 0) catch 0;
+    };
+    var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
+    const first = lines.next() orelse "";
+    const second = lines.next() orelse "";
     const title = std.mem.trim(u8, if (std.mem.startsWith(u8, first, "//")) first[2..] else "", " \t\r");
-    return gpa.dupe(u8, title);
+    const folder = if (std.mem.startsWith(u8, second, "// folder ")) std.mem.trim(u8, second["// folder ".len..], " \t\r") else "";
+    return .{ .title = gpa.dupe(u8, title) catch &.{}, .folder = gpa.dupe(u8, folder) catch &.{} };
 }
 
 pub fn draw(host: *sdk.Host) !dvui.App.Result {
@@ -173,20 +191,18 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
     }
     const theme = dvui.themeGet();
     const arena = host.arena();
-    var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both });
+    var scroll = dvui.scrollArea(@src(), .{}, .{ .expand = .both, .background = false });
     defer scroll.deinit();
     const width = if (scroll.si.viewport.w > 0) scroll.si.viewport.w else 200;
 
-    // Registered clients first, in the order they came; then any whose chats are on disk but who
-    // are not here (their plugin is not loaded).
-    var groups: std.ArrayListUnmanaged([]const u8) = .empty;
-    Commands.registeredIds(&groups, arena);
+    // Who: registered clients first, in the order they came; then any whose chats are on disk but
+    // who are not here (their plugin is not loaded).
+    var clients: std.ArrayListUnmanaged([]const u8) = .empty;
+    Commands.registeredIds(&clients, arena);
     for (rows.items) |r| {
-        for (groups.items) |g| {
-            if (std.mem.eql(u8, g, r.client)) break;
-        } else groups.append(arena, r.client) catch {};
+        if (!contains(clients.items, r.client)) clients.append(arena, r.client) catch {};
     }
-    if (groups.items.len == 0) {
+    if (clients.items.len == 0) {
         var hint = dvui.textLayout(@src(), .{}, .{
             .expand = .horizontal,
             .padding = .all(10),
@@ -198,50 +214,150 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
         hint.deinit();
         return .ok;
     }
+
     const active: []const u8 = if (host.activeDoc()) |doc| doc.owner.documentPath(doc) else "";
-    for (groups.items, 0..) |g, gi| {
-        const live = Commands.isRegistered(g);
-        {
-            var head = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = gi, .padding = .{ .x = 10, .y = 8, .w = 6, .h = 2 } });
-            defer head.deinit();
-            if (live) {
-                if (dvui.buttonIcon(@src(), "New chat", dvui.entypo.plus, .{}, .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .id_extra = gi, .min_size_content = .{ .w = 12, .h = 12 }, .padding = .all(4), .corners = .all(6) })) newChat(host, g);
-            }
-            const title = Commands.clientTitle(g) orelse g;
-            dvui.labelNoFmt(@src(), title, .{}, .{
-                .gravity_y = 0.5,
-                .font = theme.font_body.larger(-1).withWeight(.bold),
-                .color_text = .{ .color = theme.color(.content, .text).opacity(if (live) 0.75 else 0.45) },
-            });
+    const open_folder = host.folder() orelse "";
+    var tree = core.widgets.TreeWidget.tree(@src(), .{}, .{ .background = false, .expand = .horizontal });
+    defer tree.deinit();
+
+    for (clients.items) |client| {
+        const live = Commands.isRegistered(client);
+        const color = theme.color(.control, .text).opacity(if (live) 1 else 0.5);
+        const branch = groupBranch(tree, client, "", true, color, Commands.clientTitle(client) orelse client, null);
+        defer branch.deinit();
+        if (!branch.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal })) continue;
+
+        if (live) newChatRow(host, tree, client) else {
+            var note = dvui.textLayout(@src(), .{}, .{ .background = false, .margin = .{ .x = indent }, .color_text = .{ .color = color }, .max_size_content = .width(@max(width - 40, 40)) });
+            note.format("Needs the {s} plugin to continue these.", .{client}, .{});
+            note.deinit();
         }
-        if (!live) dvui.label(@src(), "needs the {s} plugin", .{g}, .{ .id_extra = gi, .margin = .{ .x = 10 }, .color_text = .{ .color = theme.color(.content, .text).opacity(0.45) }, .font = theme.font_body.larger(-2) });
-        for (rows.items, 0..) |r, i| {
-            if (!std.mem.eql(u8, r.client, g)) continue;
-            const is_active = std.mem.eql(u8, r.path, active);
-            var b: dvui.ButtonWidget = undefined;
-            b.init(@src(), .{}, .{
-                .expand = .horizontal,
-                .id_extra = i,
-                .margin = .{ .x = 4, .w = 4 },
-                .padding = .{ .x = 8, .y = 6, .w = 8, .h = 6 },
-                // The open chat on a light wash of the highlight, its text as legible as the rest.
-                .background = is_active,
-                .color_fill = .{ .color = theme.color(.highlight, .fill).opacity(0.25) },
-                .corners = .all(6),
-            });
-            b.processEvents();
-            b.drawBackground();
-            // One line, clipped to the sidebar rather than widening it.
-            dvui.labelNoFmt(@src(), if (r.title.len > 0) r.title else "New chat", .{}, .{
-                .id_extra = i,
-                .gravity_y = 0.5,
-                .max_size_content = .width(@max(width - 32, 20)),
-            });
-            if (b.clicked()) _ = host.openFile(.{ .path = r.path }) catch {};
-            b.deinit();
+        // Where: the project folders its chats were started in, newest first (rows are sorted
+        // newest first, so the order folders first appear in is theirs).
+        var folders: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (rows.items) |r| {
+            if (std.mem.eql(u8, r.client, client) and !contains(folders.items, r.folder)) folders.append(arena, r.folder) catch {};
+        }
+        for (folders.items) |folder| {
+            var holds_active = false;
+            for (rows.items) |r| {
+                if (std.mem.eql(u8, r.client, client) and std.mem.eql(u8, r.folder, folder) and std.mem.eql(u8, r.path, active)) holds_active = true;
+            }
+            const name = if (folder.len > 0) std.fs.path.basename(folder) else "No folder";
+            const fb = groupBranch(tree, client, folder, holds_active or std.mem.eql(u8, folder, open_folder) or folders.items.len == 1, color, name, dvui.entypo.folder);
+            defer fb.deinit();
+            if (!fb.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal })) continue;
+            for (rows.items) |r| {
+                if (!std.mem.eql(u8, r.client, client) or !std.mem.eql(u8, r.folder, folder)) continue;
+                chatRow(host, tree, r, std.mem.eql(u8, r.path, active), width);
+            }
         }
     }
     return .ok;
+}
+
+const indent = 14;
+
+fn contains(list: []const []const u8, s: []const u8) bool {
+    for (list) |x| if (std.mem.eql(u8, x, s)) return true;
+    return false;
+}
+
+fn idOf(parts: []const []const u8) usize {
+    var h = std.hash.Wyhash.init(0x63686174);
+    for (parts) |p| {
+        h.update(p);
+        h.update("/");
+    }
+    return @truncate(h.final());
+}
+
+fn rowOptions(id: usize, selected: bool) dvui.Options {
+    const theme = dvui.themeGet();
+    return .{
+        .id_extra = id,
+        .expand = .horizontal,
+        .color_fill_hover = .{ .color = theme.color(.control, .fill).opacity(0.5) },
+        .color_fill_press = .{ .color = theme.color(.control, .fill_press) },
+        .color_fill = .{ .color = if (selected) theme.color(.control, .fill).opacity(0.5) else core.widgets.hoverRestFill(theme.color(.control, .fill)) },
+        .padding = dvui.Rect.all(1),
+    };
+}
+
+/// A group's row: a client, or a folder under one. Its caret, its icon, its name.
+fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: []const u8, expanded: bool, color: dvui.Color, name: []const u8, icon: ?[]const u8) *core.widgets.TreeWidget.Branch {
+    const id = idOf(&.{ client, folder, "group" });
+    const branch = tree.branch(@src(), .{
+        .expanded = expanded,
+        .animation_duration = 300_000,
+        .animation_easing = core.motion.enter,
+        .can_accept_children = false,
+        .draggable = false,
+        .branch_id = id,
+    }, rowOptions(id, false));
+    core.widgets.treeCaret(@src(), branch.expanded, color);
+    if (icon) |tvg| {
+        var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
+        core.icon.icon(@src(), "chat-group", tvg, .{ .fill_color = .{ .color = color } }, core.widgets.treeRowIconOptions(.{}));
+        slot.deinit();
+    }
+    dvui.labelNoFmt(@src(), name, .{}, .{
+        .gravity_y = 0.5,
+        .color_text = .{ .color = color },
+        .font = if (icon == null) dvui.themeGet().font_body.withWeight(.bold) else null,
+    });
+    return branch;
+}
+
+fn newChatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, client: []const u8) void {
+    const theme = dvui.themeGet();
+    const id = idOf(&.{ client, "new" });
+    const branch = tree.branch(@src(), .{ .can_accept_children = false, .draggable = false, .branch_id = id }, rowOptions(id, false));
+    defer branch.deinit();
+    {
+        var slot = core.widgets.treeRowGlyph(@src(), .{});
+        slot.deinit();
+    }
+    {
+        var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
+        core.icon.icon(@src(), "chat-new", dvui.entypo.plus, .{ .fill_color = .{ .color = theme.color(.highlight, .fill) } }, core.widgets.treeRowIconOptions(.{}));
+        slot.deinit();
+    }
+    dvui.labelNoFmt(@src(), "New chat", .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = theme.color(.highlight, .fill) } });
+    if (branch.button.clicked()) newChat(host, client);
+}
+
+fn chatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, r: Row, selected: bool, width: f32) void {
+    const theme = dvui.themeGet();
+    const id = idOf(&.{r.path});
+    const branch = tree.branch(@src(), .{ .can_accept_children = false, .draggable = false, .branch_id = id }, rowOptions(id, selected));
+    defer branch.deinit();
+    {
+        var slot = core.widgets.treeRowGlyph(@src(), .{});
+        slot.deinit();
+    }
+    {
+        var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
+        core.icon.icon(@src(), "chat-row", dvui.entypo.chat, .{ .fill_color = .{ .color = theme.color(.control, .text).opacity(0.7) } }, core.widgets.treeRowIconOptions(.{}));
+        slot.deinit();
+    }
+    // When it last moved, at the right; the title takes what is left, on one line.
+    dvui.labelNoFmt(@src(), age(host.arena(), r.modified), .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = theme.color(.control, .text).opacity(0.45) }, .font = theme.font_body.larger(-2) });
+    dvui.labelNoFmt(@src(), if (r.title.len > 0) r.title else "New chat", .{}, .{
+        .gravity_y = 0.5,
+        .color_text = .{ .color = theme.color(if (selected) .window else .control, .text) },
+        .max_size_content = .width(@max(width - 110, 20)),
+    });
+    if (branch.button.clicked()) _ = host.openFile(.{ .path = r.path }) catch {};
+}
+
+/// How long ago, as a person says it: "now", "5m", "3h", "2d", "6w".
+fn age(arena: std.mem.Allocator, modified: i64) []const u8 {
+    const now = std.Io.Clock.real.now(dvui.io).toSeconds();
+    const s = @max(0, now - modified);
+    if (s < 60) return "now";
+    const v, const unit: []const u8 = if (s < 3600) .{ @divFloor(s, 60), "m" } else if (s < 86400) .{ @divFloor(s, 3600), "h" } else if (s < 86400 * 14) .{ @divFloor(s, 86400), "d" } else .{ @divFloor(s, 86400 * 7), "w" };
+    return std.fmt.allocPrint(arena, "{d}{s}", .{ v, unit }) catch "";
 }
 
 /// New, for `client`: its own `chat_new` when it has one (it may want to set the chat up), else a

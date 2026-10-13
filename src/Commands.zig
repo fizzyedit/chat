@@ -39,6 +39,7 @@ pub fn adopt(c: *Chat) void {
         std.mem.swap(@TypeOf(c.transcript), &c.transcript, &o.transcript);
         std.mem.swap(@TypeOf(c.title), &c.title, &o.title);
         std.mem.swap([]u8, &c.resume_state, &o.resume_state);
+        std.mem.swap([]u8, &c.folder, &o.folder);
         c.busy = o.busy;
         c.resumed = o.resumed;
         c.header_dirty = true;

@@ -34,6 +34,16 @@ pub const State = struct {
     set_y: f32 = 0,
     /// Thoughts opened, by `partKey`.
     open: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    /// Messages there when the chat was first drawn: they are history, shown as they are. One that
+    /// arrives after fades in, and its text types in (`reveal`).
+    seen: ?usize = null,
+    /// How many messages the chat had when it was first drawn: those never type in.
+    history: ?usize = null,
+    /// Messages fading in, and when each fade ends (`dvui.frameTimeNS`).
+    fading: std.AutoHashMapUnmanaged(u32, i128) = .empty,
+    /// How much of each arriving text block is shown, by `partKey`: it runs to catch up with what
+    /// has streamed in, so text arrives smoothly rather than in the agent's bursts.
+    reveal: std.AutoHashMapUnmanaged(u64, f32) = .empty,
 
     const Kept = struct {
         version: u32 = std.math.maxInt(u32),
@@ -51,6 +61,10 @@ pub const State = struct {
     pub fn reset(self: *State, gpa: std.mem.Allocator) void {
         self.kept.clearRetainingCapacity();
         self.open.clearRetainingCapacity();
+        self.fading.clearRetainingCapacity();
+        self.reveal.clearRetainingCapacity();
+        self.seen = null;
+        self.history = null;
         _ = gpa;
         self.follow = true;
     }
@@ -58,6 +72,8 @@ pub const State = struct {
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         self.kept.deinit(gpa);
         self.open.deinit(gpa);
+        self.fading.deinit(gpa);
+        self.reveal.deinit(gpa);
     }
 };
 
@@ -103,6 +119,14 @@ fn drawTranscript(c: *Chat) void {
     const gpa = c.gpa;
     const messages = c.transcript.messages.items;
     if (st.kept.items.len < messages.len) st.kept.appendNTimes(gpa, .{}, messages.len - st.kept.items.len) catch return;
+    // What arrived since last frame fades in; what was there when the chat opened does not.
+    const seen = st.seen orelse messages.len;
+    if (seen < messages.len and !core.motion.off()) {
+        const end = dvui.frameTimeNS() + @as(i128, core.motion.duration(fade_us)) * std.time.ns_per_us;
+        for (seen..messages.len) |n| st.fading.put(gpa, @intCast(n), end) catch {};
+    }
+    st.seen = messages.len;
+    if (st.history == null) st.history = messages.len;
 
     const vh = st.scroll.viewport.h;
     // Put the viewport where the reader is, before the scroll area reads it.
@@ -195,14 +219,26 @@ fn drawHint(c: *Chat, width: f32) void {
     tl.addText("\nAsk anything. Enter sends; Shift+Enter starts a new line.", .{});
 }
 
+/// How long a new message takes to fade in, as written (through `core.motion.duration`).
+const fade_us = 220_000;
+
 fn drawMessage(c: *Chat, i: usize, m: *Transcript.Message, width: f32) f32 {
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = i, .padding = .{ .x = side_pad, .y = 4, .w = side_pad, .h = 4 } });
     const id = row.data().id;
     const avail = @max(width - 2 * side_pad, 60);
+    // A message that just arrived fades in. Only while it fades is it wrapped: a message drawn
+    // again after scrolling back into view is not new.
+    var fade: ?*dvui.AnimateWidget = null;
+    if (c.view.fading.get(@intCast(i))) |end| {
+        if (dvui.frameTimeNS() < end) {
+            fade = dvui.animate(@src(), .{ .kind = .alpha, .duration = core.motion.duration(fade_us), .easing = core.motion.enter }, .{ .expand = .horizontal, .id_extra = i });
+        } else _ = c.view.fading.remove(@intCast(i));
+    }
     switch (m.author) {
         .note => drawNote(c, i, m, avail),
-        .person, .other => drawBubble(c, i, m, avail),
+        .person, .other => if (m.parts.items.len == 0) drawDots(c, i) else drawBubble(c, i, m, avail),
     }
+    if (fade) |f| f.deinit();
     row.deinit();
     return if (dvui.minSizeGet(id)) |s| s.h else 0;
 }
@@ -242,7 +278,6 @@ fn drawBubble(c: *Chat, i: usize, m: *Transcript.Message, avail: f32) void {
         .max_size_content = .width(inner_w),
     });
     defer bubble.deinit();
-    if (m.parts.items.len == 0) return drawDots(c, i);
     for (m.parts.items, 0..) |*p, j| switch (p.*) {
         .block => |*b| drawBlock(c, i, j, b, inner_w, j + 1 == m.parts.items.len),
         .tool => |t| drawTool(c, t, inner_w),
@@ -276,7 +311,7 @@ fn naturalWidth(c: *Chat, i: usize, m: *const Transcript.Message, max: f32) f32 
 
 fn drawBlock(c: *Chat, i: usize, j: usize, b: *Transcript.Block, w: f32, last: bool) void {
     switch (b.*) {
-        .text => |t| markdown(c, partKey(c.chat_id, i, j, 't'), t.items, w, i * 64 + j),
+        .text => |t| markdown(c, partKey(c.chat_id, i, j, 't'), if (c.transcript.messages.items[i].author == .other) revealed(c, i, partKey(c.chat_id, i, j, 'r'), t.items) else t.items, w, i * 64 + j),
         .thought => |t| drawThought(c, partKey(c.chat_id, i, j, 'h'), t.items, w, last and c.busy, i * 64 + j),
         .code => |code| drawCode(c, partKey(c.chat_id, i, j, 'c'), code.language, code.text, w, i * 64 + j),
         .image => |img| drawImage(img, w, i * 64 + j),
@@ -284,6 +319,27 @@ fn drawBlock(c: *Chat, i: usize, j: usize, b: *Transcript.Block, w: f32, last: b
         .diff => |d| drawDiff(d.path, d.old, d.new, w, i * 64 + j),
         .plan => |p| drawPlan(p, w, i * 64 + j),
     }
+}
+
+/// How much of an arriving text block to show: it runs to catch up with what has streamed in,
+/// faster the further behind it is (all of it within about a sixth of a second), so a reply types
+/// in smoothly instead of in the agent's bursts. History, and everything with motion off, shows
+/// whole. Cut on a UTF-8 boundary.
+fn revealed(c: *Chat, i: usize, key: u64, text: []const u8) []const u8 {
+    const st = &c.view;
+    if (core.motion.off() or i < (st.history orelse 0)) return text;
+    const gop = st.reveal.getOrPut(c.gpa, key) catch return text;
+    if (!gop.found_existing) gop.value_ptr.* = 0;
+    const shown = gop.value_ptr;
+    const len: f32 = @floatFromInt(text.len);
+    if (shown.* >= len) return text;
+    const behind = len - shown.*;
+    const per_second = @max(120.0, behind * 6.0) * core.motion.rate();
+    shown.* = @min(len, shown.* + per_second * dvui.secondsSinceLastFrame());
+    dvui.refresh(null, @src(), null);
+    var n: usize = @intFromFloat(shown.*);
+    while (n < text.len and n > 0 and (text[n] & 0xC0) == 0x80) n += 1;
+    return text[0..n];
 }
 
 /// Markdown through the markdown plugin when it is there; plain wrapped text when it is not.
@@ -598,20 +654,14 @@ fn drawTyping(c: *Chat, width: f32) void {
     _ = width;
     var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = side_pad, .y = 4, .w = side_pad, .h = 4 } });
     defer row.deinit();
-    var bubble = dvui.box(@src(), .{ .dir = .horizontal }, .{
-        .background = true,
-        .color_fill = .{ .color = bubbleFill(false) },
-        .corners = .{ .tl = .round(14), .tr = .round(14), .br = .round(14), .bl = .round(4) },
-        .padding = bubble_pad,
-    });
-    defer bubble.deinit();
     drawDots(c, 0);
 }
 
-/// fizzy's spinner, boiling: what a turn that has not said anything yet looks like.
+/// fizzy's spinner, boiling, on its own where the reply will be: what a turn that has not said
+/// anything yet looks like. Not in a bubble: there is nothing to hold yet.
 fn drawDots(c: *Chat, id_extra: usize) void {
     _ = c;
-    core.dialogs.bubbleSpinner(@src(), .{ .id_extra = id_extra, .min_size_content = .{ .w = 22, .h = 22 }, .gravity_y = 0.5 }, .{});
+    core.dialogs.bubbleSpinner(@src(), .{ .id_extra = id_extra, .min_size_content = .{ .w = 26, .h = 26 }, .gravity_y = 0.5, .margin = .{ .x = 4, .y = 2, .h = 2 } }, .{});
 }
 
 // ---- the input ------------------------------------------------------------------------------

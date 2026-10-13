@@ -26,6 +26,8 @@ client_id: []u8,
 title: std.ArrayListUnmanaged(u8) = .empty,
 /// What the client last gave `setResume`, handed back to it when the chat is opened again.
 resume_state: []u8 = &.{},
+/// The project folder the chat was started in; empty for none. The list groups chats by it.
+folder: []u8 = &.{},
 /// The client was handed `resume_state` for this registration of it.
 resumed: bool = false,
 transcript: Transcript,
@@ -76,6 +78,7 @@ pub fn fromBytes(path: []const u8, bytes: []const u8) !Chat {
             }
             try self.title.appendSlice(gpa, h.title);
             self.resume_state = h.@"resume";
+            self.folder = h.folder;
         } else |err| {
             // A transcript fizzy cannot read still opens: say so, and leave the file as it is.
             self.transcript.deinit();
@@ -128,7 +131,7 @@ pub fn write(self: *Chat) !void {
     defer out.deinit();
     const dir = try self.imagesDir(self.gpa);
     defer self.gpa.free(dir);
-    try self.transcript.save(&out.writer, .{ .client = self.client_id, .title = self.title.items, .@"resume" = self.resume_state }, dir, dvui.io);
+    try self.transcript.save(&out.writer, .{ .client = self.client_id, .title = self.title.items, .folder = self.folder, .@"resume" = self.resume_state }, dir, dvui.io);
     if (std.fs.path.dirname(self.path)) |d| std.Io.Dir.cwd().createDirPath(dvui.io, d) catch {};
     try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = self.path, .data = out.written() });
     self.saved_version = self.transcript.version;
@@ -144,6 +147,7 @@ pub fn reloadTranscript(self: *Chat) !void {
     std.mem.swap(Transcript, &self.transcript, &fresh.transcript);
     std.mem.swap(std.ArrayListUnmanaged(u8), &self.title, &fresh.title);
     std.mem.swap([]u8, &self.resume_state, &fresh.resume_state);
+    std.mem.swap([]u8, &self.folder, &fresh.folder);
     self.saved_version = self.transcript.version;
     self.view.reset(self.gpa);
 }
@@ -173,6 +177,7 @@ fn deinitFields(self: *Chat) void {
     self.input.deinit(self.gpa);
     self.title.deinit(self.gpa);
     self.gpa.free(self.resume_state);
+    self.gpa.free(self.folder);
     self.gpa.free(self.client_id);
     self.gpa.free(self.path);
 }
