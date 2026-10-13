@@ -24,7 +24,27 @@ pub var settings: *const Settings = undefined;
 var sessions: std.AutoArrayHashMapUnmanaged(api.ChatId, *Session) = .empty;
 
 const State = enum { idle, starting, ready, prompting, stopped };
-const Pending = enum { initialize, session_new, session_resume, session_load, prompt };
+const Pending = enum { initialize, session_new, session_resume, session_load, prompt, set_option };
+
+/// One block of a prompt, as ACP writes it: text, an image's bytes, or a link to a file.
+const Content = struct {
+    type: []const u8,
+    text: ?[]const u8 = null,
+    mimeType: ?[]const u8 = null,
+    data: ?[]const u8 = null,
+    uri: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+};
+
+/// A message waiting for its session to open: its prompt, built once, in its own arena.
+const Queued = struct {
+    arena: std.heap.ArenaAllocator,
+    content: []const Content,
+};
+
+/// What the person last chose for each setting (`chat_setting`), by its id: a new session starts
+/// with the model and mode they were using.
+var preferred: std.StringHashMapUnmanaged([]u8) = .empty;
 
 /// An agent starting on a thread of its own: finding the command on the login shell's PATH and
 /// spawning it take seconds the first time, which the UI thread must never wait on.
@@ -61,7 +81,7 @@ const Session = struct {
     next_id: i64 = 1,
     pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
     /// What the person sent before the agent was ready: sent once the session opens.
-    queued: ?[]u8 = null,
+    queued: ?Queued = null,
     /// The chat's project folder, where the agent works; empty: the one fizzy has open.
     folder: ?[]u8 = null,
     has_mcp: bool = false,
@@ -84,7 +104,7 @@ const Session = struct {
 
     fn deinit(self: *Session) void {
         self.disconnect();
-        if (self.queued) |q| self.gpa.free(q);
+        if (self.queued) |*q| q.arena.deinit();
         if (self.resume_id) |r| self.gpa.free(r);
         if (self.folder) |f| self.gpa.free(f);
         self.pending.deinit(self.gpa);
@@ -141,6 +161,7 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
         .{ "chat_cancel", api.ChatOnly, onCancel },
         .{ "chat_closed", api.ChatOnly, onClosed },
         .{ "chat_resume", api.Resume, onResume },
+        .{ "chat_setting", api.Choose, onSetting },
         .{ "chat_new", api.NewChat, onNew },
     }) |entry| try host.registerCommand(.{
         .id = client_id ++ "." ++ entry[0],
@@ -201,14 +222,94 @@ fn sessionFor(chat: api.ChatId) ?*Session {
 fn onSend(a: api.Send) void {
     const s = sessionFor(a.chat) orelse return;
     if (s.folder == null and a.folder.len > 0) s.folder = s.gpa.dupe(u8, a.folder) catch null;
+    if (s.state == .prompting) return;
+    var q: Queued = .{ .arena = .init(s.gpa), .content = &.{} };
+    q.content = promptOf(q.arena.allocator(), a) catch {
+        q.arena.deinit();
+        return fail(s, "Could not read what was attached.", .{});
+    };
+    if (s.queued) |*old| old.arena.deinit();
+    s.queued = q;
     switch (s.state) {
-        .ready => prompt(s, a.text),
+        .ready => sendQueued(s),
         .prompting => {},
-        .starting, .idle, .stopped => {
-            if (s.queued) |q| s.gpa.free(q);
-            s.queued = s.gpa.dupe(u8, a.text) catch null;
-            if (s.agent == null and s.launch == null) connect(s);
+        .starting, .idle, .stopped => if (s.agent == null and s.launch == null) connect(s),
+    }
+}
+
+/// The person's message as an ACP prompt: their text, each image's bytes, each file as a link.
+fn promptOf(arena: std.mem.Allocator, a: api.Send) ![]const Content {
+    var out: std.ArrayListUnmanaged(Content) = .empty;
+    if (a.text.len > 0) try out.append(arena, .{ .type = "text", .text = a.text });
+    for (a.attached) |b| switch (b) {
+        .image => |img| {
+            const bytes = try std.Io.Dir.cwd().readFileAlloc(dvui.io, img.path, arena, .limited(32 * 1024 * 1024));
+            const encoded = try arena.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+            _ = std.base64.standard.Encoder.encode(encoded, bytes);
+            try out.append(arena, .{ .type = "image", .mimeType = img.mime, .data = encoded });
         },
+        .file => |f| try out.append(arena, .{
+            .type = "resource_link",
+            .uri = try std.fmt.allocPrint(arena, "file://{s}", .{f.path}),
+            .name = std.fs.path.basename(f.path),
+        }),
+        else => {},
+    };
+    return out.items;
+}
+
+fn onSetting(a: api.Choose) void {
+    const gpa = sdk.allocator();
+    const value = gpa.dupe(u8, a.value) catch return;
+    const gop = preferred.getOrPut(gpa, a.id) catch return gpa.free(value);
+    if (gop.found_existing) gpa.free(gop.value_ptr.*) else gop.key_ptr.* = gpa.dupe(u8, a.id) catch {
+        _ = preferred.remove(a.id);
+        return gpa.free(value);
+    };
+    gop.value_ptr.* = value;
+    const s = sessions.get(a.chat) orelse return;
+    const session = s.session_id orelse return;
+    request(s, .set_option, "session/set_config_option", .{ .sessionId = session, .configId = a.id, .value = a.value });
+}
+
+/// The agent's settings (ACP `configOptions`: its model, its mode), by the chat's message box.
+fn publishSettings(s: *Session, options: ?json.Value) void {
+    const list = options orelse return;
+    if (list != .array) return;
+    const arena = sdk.host().arena();
+    var out: std.ArrayListUnmanaged(api.Setting) = .empty;
+    for (list.array.items) |o| {
+        if (!std.mem.eql(u8, str(field(o, "type")) orelse "", "select")) continue;
+        var choices: std.ArrayListUnmanaged(api.Setting.Choice) = .empty;
+        if (field(o, "options")) |opts| if (opts == .array) for (opts.array.items) |c| {
+            choices.append(arena, .{
+                .value = str(field(c, "value")) orelse continue,
+                .name = str(field(c, "name")) orelse str(field(c, "value")).?,
+                .description = str(field(c, "description")) orelse "",
+            }) catch {};
+        };
+        out.append(arena, .{
+            .id = str(field(o, "id")) orelse continue,
+            .name = str(field(o, "name")) orelse "",
+            .current = str(field(o, "currentValue")) orelse "",
+            .description = str(field(o, "description")) orelse "",
+            .choices = choices.items,
+        }) catch {};
+    }
+    _ = call("chat.set_settings", api.SetSettings{ .chat = s.chat, .settings = out.items });
+}
+
+/// A new session starts with what the person chose last: each setting they set differently is
+/// set again.
+fn applyPreferred(s: *Session, options: ?json.Value) void {
+    const list = options orelse return;
+    if (list != .array) return;
+    const session = s.session_id orelse return;
+    for (list.array.items) |o| {
+        const id = str(field(o, "id")) orelse continue;
+        const want = preferred.get(id) orelse continue;
+        if (std.mem.eql(u8, str(field(o, "currentValue")) orelse "", want)) continue;
+        request(s, .set_option, "session/set_config_option", .{ .sessionId = session, .configId = id, .value = want });
     }
 }
 
@@ -239,8 +340,15 @@ fn onClosed(a: api.ChatOnly) void {
     sdk.allocator().destroy(kv.value);
 }
 
+/// A new chat, and its agent started now rather than at the first message: its settings (the
+/// model, the mode) are by the message box before anything is asked, and the first answer comes
+/// sooner.
 fn onNew(a: api.NewChat) void {
-    _ = call("chat.open", api.Open{ .client = client_id, .folder = a.folder });
+    const r = call("chat.open", api.Open{ .client = client_id, .folder = a.folder }) orelse return;
+    const opened = api.parse(api.Opened, sdk.host().arena(), r) catch return;
+    const s = sessionFor(opened.chat) orelse return;
+    if (a.folder.len > 0) s.folder = s.gpa.dupe(u8, a.folder) catch null;
+    connect(s);
 }
 
 /// What every agent sent since the last frame. Once a frame, from the plugin's `beginFrame`.
@@ -382,11 +490,14 @@ fn sessionOpen(s: *Session, id: []const u8, how: []const u8) void {
     s.state = .ready;
     s.replaying = false;
     if (s.has_mcp) note(s, "{s} The agent can see and drive fizzy.", .{how}) else note(s, "{s}", .{how});
-    if (s.queued) |q| {
-        s.queued = null;
-        defer s.gpa.free(q);
-        prompt(s, q);
-    } else setBusy(s, false);
+    if (s.queued != null) sendQueued(s) else setBusy(s, false);
+}
+
+fn sendQueued(s: *Session) void {
+    var q = s.queued orelse return;
+    s.queued = null;
+    defer q.arena.deinit();
+    prompt(s, q.content);
 }
 
 /// The setting's fizzy-mcp, else the one beside the agent plugin.
@@ -402,11 +513,10 @@ fn findMcp(arena: std.mem.Allocator) ?[]const u8 {
     return path;
 }
 
-fn prompt(s: *Session, text: []const u8) void {
+fn prompt(s: *Session, blocks: []const Content) void {
     const session = s.session_id orelse return;
-    const Block = struct { type: []const u8, text: []const u8 };
     s.turn = null;
-    request(s, .prompt, "session/prompt", .{ .sessionId = session, .prompt = &[_]Block{.{ .type = "text", .text = text }} });
+    request(s, .prompt, "session/prompt", .{ .sessionId = session, .prompt = blocks });
     s.state = .prompting;
     setBusy(s, true);
 }
@@ -459,8 +569,8 @@ fn frameSession(s: *Session) void {
         if (why.len > 0) note(s, "The agent stopped:\n\n```\n{s}\n```", .{why}) else note(s, "The agent stopped.", .{});
         s.disconnect();
         setBusy(s, false);
-        if (s.queued) |q| {
-            s.gpa.free(q);
+        if (s.queued) |*q| {
+            q.arena.deinit();
             s.queued = null;
         }
     }
@@ -495,9 +605,15 @@ fn answered(s: *Session, what: Pending, result: json.Value) void {
         .session_new => {
             const id = str(field(result, "sessionId")) orelse return fail(s, "The agent opened no session.", .{});
             sessionOpen(s, id, "Connected.");
+            publishSettings(s, field(result, "configOptions"));
+            applyPreferred(s, field(result, "configOptions"));
         },
         // A resumed or loaded session keeps its id; the answer may not repeat it.
-        .session_resume, .session_load => sessionOpen(s, s.resume_id orelse "", "Picked up where you left off."),
+        .session_resume, .session_load => {
+            sessionOpen(s, s.resume_id orelse "", "Picked up where you left off.");
+            publishSettings(s, field(result, "configOptions"));
+        },
+        .set_option => publishSettings(s, field(result, "configOptions")),
         .prompt => {
             s.state = .ready;
             s.turn = null;
@@ -531,6 +647,7 @@ fn refused(s: *Session, what: Pending, err: []const u8) void {
             note(s, "{s}", .{err});
             setBusy(s, false);
         },
+        .set_option => note(s, "The agent did not take that setting: {s}", .{err}),
     }
 }
 
@@ -548,6 +665,8 @@ fn update(s: *Session, params: json.Value) void {
         toolCall(s, u);
     } else if (std.mem.eql(u8, kind, "tool_call_update")) {
         toolUpdate(s, u);
+    } else if (std.mem.eql(u8, kind, "config_option_update")) {
+        publishSettings(s, field(u, "configOptions"));
     } else if (std.mem.eql(u8, kind, "plan")) {
         const items = field(u, "entries") orelse return;
         if (items != .array) return;

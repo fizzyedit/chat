@@ -35,10 +35,23 @@ transcript: Transcript,
 input: std.ArrayList(u8) = .empty,
 /// A turn is running (`setBusy`): Stop is offered where Send was.
 busy: bool = false,
+/// What the client offers to set by the message box (`chat.set_settings`), in `settings_arena`.
+settings: []chat.Setting = &.{},
+settings_arena: ?std.heap.ArenaAllocator = null,
+/// Files the person attached and has not sent yet: shown above the message box, sent with it.
+attached: std.ArrayListUnmanaged(Attachment) = .empty,
 view: View.State = .{},
 /// The transcript's and the header's state when last written.
 saved_version: u64 = 0,
 header_dirty: bool = false,
+
+pub const Attachment = struct {
+    path: []u8,
+    mime: []const u8,
+    pub fn image(self: Attachment) bool {
+        return std.mem.startsWith(u8, self.mime, "image/");
+    }
+};
 
 /// The chat plugin itself, which owns every chat's `DocHandle` (set once, in `register`).
 pub var owner: *sdk.Plugin = undefined;
@@ -172,6 +185,9 @@ pub fn deinit(self: *Chat) void {
 }
 
 fn deinitFields(self: *Chat) void {
+    if (self.settings_arena) |*a| a.deinit();
+    for (self.attached.items) |a| self.gpa.free(a.path);
+    self.attached.deinit(self.gpa);
     self.view.deinit(self.gpa);
     self.transcript.deinit();
     self.input.deinit(self.gpa);
@@ -182,23 +198,89 @@ fn deinitFields(self: *Chat) void {
     self.gpa.free(self.path);
 }
 
+/// The settings the client offers, copied: replacing any it offered before.
+pub fn setSettings(self: *Chat, settings: []const chat.Setting) !void {
+    var arena: std.heap.ArenaAllocator = .init(self.gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+    const out = try a.alloc(chat.Setting, settings.len);
+    for (settings, out) |s, *o| {
+        const choices = try a.alloc(chat.Setting.Choice, s.choices.len);
+        for (s.choices, choices) |c, *oc| oc.* = .{ .value = try a.dupe(u8, c.value), .name = try a.dupe(u8, c.name), .description = try a.dupe(u8, c.description) };
+        o.* = .{ .id = try a.dupe(u8, s.id), .name = try a.dupe(u8, s.name), .current = try a.dupe(u8, s.current), .description = try a.dupe(u8, s.description), .choices = choices };
+    }
+    if (self.settings_arena) |*old| old.deinit();
+    self.settings_arena = arena;
+    self.settings = out;
+}
+
+/// The person chose `value` for setting `id`: shown at once, and told to the client, which
+/// answers with what it is now.
+pub fn chooseSetting(self: *Chat, id: []const u8, value: []const u8) void {
+    for (self.settings) |*s| if (std.mem.eql(u8, s.id, id)) {
+        for (s.choices) |c| if (std.mem.eql(u8, c.value, value)) {
+            s.current = c.value;
+        };
+    };
+    Commands.callClient(self.client_id, "chat_setting", chat.Choose{ .chat = self.chat_id, .id = id, .value = value });
+}
+
+/// A file to send with the next message.
+pub fn attach(self: *Chat, path: []const u8) void {
+    for (self.attached.items) |a| if (std.mem.eql(u8, a.path, path)) return;
+    const owned = self.gpa.dupe(u8, path) catch return;
+    self.attached.append(self.gpa, .{ .path = owned, .mime = mimeOf(path) }) catch self.gpa.free(owned);
+}
+
+pub fn detach(self: *Chat, index: usize) void {
+    if (index >= self.attached.items.len) return;
+    self.gpa.free(self.attached.orderedRemove(index).path);
+}
+
+fn mimeOf(path: []const u8) []const u8 {
+    const ext = std.fs.path.extension(path);
+    const known = [_][2][]const u8{ .{ ".png", "image/png" }, .{ ".jpg", "image/jpeg" }, .{ ".jpeg", "image/jpeg" }, .{ ".gif", "image/gif" }, .{ ".webp", "image/webp" }, .{ ".bmp", "image/bmp" } };
+    for (known) |k| if (std.ascii.eqlIgnoreCase(ext, k[0])) return k[1];
+    return "text/plain";
+}
+
 // ---- the person -----------------------------------------------------------------------------
 
 /// What the person typed, to the chat's client: posted as theirs, then handed over. False when
 /// there is nothing to send or no client to send it to (the text stays where it was typed).
 pub fn send(self: *Chat, text: []const u8) bool {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0 or !Commands.isRegistered(self.client_id)) return false;
-    _ = self.transcript.post(.person, &.{.{ .text = trimmed }}) catch return false;
+    if ((trimmed.len == 0 and self.attached.items.len == 0) or !Commands.isRegistered(self.client_id)) return false;
+    // The message as the person sees it: their text, the images they attached shown, the files as
+    // links. The client gets the same, by path.
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var shown: std.ArrayListUnmanaged(chat.Block) = .empty;
+    var sent: std.ArrayListUnmanaged(chat.Block) = .empty;
+    if (trimmed.len > 0) shown.append(arena, .{ .text = trimmed }) catch return false;
+    for (self.attached.items) |a| {
+        if (a.image()) {
+            const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, a.path, arena, .limited(32 * 1024 * 1024)) catch continue;
+            shown.append(arena, .{ .image = .{ .mime = a.mime, .bytes = bytes, .alt = std.fs.path.basename(a.path) } }) catch {};
+            sent.append(arena, .{ .image = .{ .path = a.path, .mime = a.mime } }) catch {};
+        } else {
+            shown.append(arena, .{ .file = .{ .path = a.path } }) catch {};
+            sent.append(arena, .{ .file = .{ .path = a.path } }) catch {};
+        }
+    }
+    _ = self.transcript.post(.person, shown.items) catch return false;
     // A chat is named by the first thing asked in it, unless its client names it.
     if (self.title.items.len == 0) {
-        const line = trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len];
+        const line = if (trimmed.len > 0) trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len] else std.fs.path.basename(self.attached.items[0].path);
         var buf: [64]u8 = undefined;
         const cut = if (line.len > 60) std.fmt.bufPrint(&buf, "{s}...", .{line[0..57]}) catch line[0..60] else line;
         self.setTitle(cut);
     }
     self.view.follow = true;
-    Commands.callClient(self.client_id, "chat_send", chat.Send{ .chat = self.chat_id, .text = trimmed, .folder = self.folder });
+    Commands.callClient(self.client_id, "chat_send", chat.Send{ .chat = self.chat_id, .text = trimmed, .folder = self.folder, .attached = sent.items });
+    for (self.attached.items) |a| self.gpa.free(a.path);
+    self.attached.clearRetainingCapacity();
     return true;
 }
 

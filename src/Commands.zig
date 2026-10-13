@@ -132,6 +132,8 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
         .{ "set_title", api.SetTitle, cmdSetTitle },
         .{ "set_resume", api.SetResume, cmdSetResume },
         .{ "focus", api.Focus, cmdFocus },
+        .{ "set_settings", api.SetSettings, cmdSetSettings },
+        .{ "attach", api.Attach, cmdAttach },
     }) |entry| {
         try host.registerCommand(.{
             .id = "chat." ++ entry[0],
@@ -155,6 +157,13 @@ fn Handler(comptime Args: type, comptime f: fn (Args, *sdk.Command.Call) anyerro
             return f(args, call);
         }
     };
+}
+
+/// The chat whose tab is in front, if the document in front is a chat.
+fn front() ?*Chat {
+    const doc = sdk.host().activeDoc() orelse return null;
+    for (chats.values()) |c| if (c.id == doc.id) return c;
+    return null;
 }
 
 fn find(id: api.ChatId, call: *sdk.Command.Call) !*Chat {
@@ -308,6 +317,20 @@ fn cmdSetResume(a: api.SetResume, call: *sdk.Command.Call) !void {
     const c = try find(a.chat, call);
     c.setResume(a.state);
     c.resumed = true;
+}
+
+fn cmdSetSettings(a: api.SetSettings, call: *sdk.Command.Call) !void {
+    const c = try find(a.chat, call);
+    try c.setSettings(a.settings);
+    changed(c);
+}
+
+/// What the person's + does, for whoever else attaches: a drop from the file tree, an agent.
+fn cmdAttach(a: api.Attach, call: *sdk.Command.Call) !void {
+    const c = if (a.chat != 0) try find(a.chat, call) else front() orelse return call.fail("no chat is in front", .{});
+    std.Io.Dir.cwd().access(dvui.io, a.path, .{}) catch return call.fail("no file at {s}", .{a.path});
+    c.attach(a.path);
+    changed(c);
 }
 
 fn cmdFocus(a: api.Focus, call: *sdk.Command.Call) !void {

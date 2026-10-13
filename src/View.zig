@@ -673,34 +673,56 @@ fn drawDots(c: *Chat, id_extra: usize) void {
 
 // ---- the input ------------------------------------------------------------------------------
 
+/// The message box: what is attached, the text, and under it a row of what goes with the message:
+/// + to attach files and images, the client's settings (an agent's model, its mode) as dropdowns,
+/// and Send, or Stop while a turn runs.
 fn drawInput(c: *Chat) void {
     const theme = dvui.themeGet();
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 1, .padding = .{ .x = 12, .y = 8, .w = 12, .h = 12 } });
-    defer row.deinit();
+    var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .gravity_y = 1, .padding = .{ .x = 12, .y = 8, .w = 12, .h = 10 } });
+    defer col.deinit();
 
-    // Send or Stop, at the right: packed first so the entry takes the rest.
+    // Packed from the bottom: the row of controls, then the text above it, then what is attached.
+    var send_now = false;
     {
-        const busy = c.busy;
-        var b: dvui.ButtonWidget = undefined;
-        b.init(@src(), .{}, .{
-            .gravity_x = 1,
-            .gravity_y = 1,
-            .margin = .{ .x = 8 },
-            .padding = .all(8),
-            .corners = .all(16),
-            .background = true,
-            .color_fill = .{ .color = if (busy) theme.color(.control, .fill) else theme.color(.highlight, .fill) },
-            .label = .{ .text = if (busy) "Stop" else "Send" },
-        });
-        b.processEvents();
-        b.drawBackground();
-        // On the highlight, the icon takes the content's fill, as text on a highlighted control would.
-        core.icon.icon(@src(), "send", if (busy) entypo.controller_stop else entypo.paper_plane, .{ .fill_color = .{ .color = if (busy) theme.color(.content, .text) else theme.color(.content, .fill) } }, .{ .min_size_content = .{ .w = 16, .h = 16 } });
-        const clicked = b.clicked();
-        b.deinit();
-        if (clicked) {
-            if (busy) c.cancel() else if (c.send(c.input.items)) c.input.clearRetainingCapacity();
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .gravity_y = 1, .margin = .{ .y = 6 } });
+        defer row.deinit();
+        // Send or Stop at the right, packed first so the settings take what is left.
+        {
+            const busy = c.busy;
+            var b: dvui.ButtonWidget = undefined;
+            b.init(@src(), .{}, .{
+                .gravity_x = 1,
+                .gravity_y = 0.5,
+                .padding = .all(7),
+                .corners = .all(16),
+                .background = true,
+                .color_fill = .{ .color = if (busy) theme.color(.control, .fill) else theme.color(.highlight, .fill) },
+                .label = .{ .text = if (busy) "Stop" else "Send" },
+            });
+            b.processEvents();
+            b.drawBackground();
+            // On the highlight, the icon takes the content's fill, as text on a highlighted control would.
+            core.icon.icon(@src(), "send", if (busy) entypo.controller_stop else entypo.paper_plane, .{ .fill_color = .{ .color = if (busy) theme.color(.content, .text) else theme.color(.content, .fill) } }, .{ .min_size_content = .{ .w = 14, .h = 14 } });
+            if (b.clicked()) {
+                if (busy) c.cancel() else send_now = true;
+            }
+            b.deinit();
         }
+        // + : attach files and images.
+        {
+            var b: dvui.ButtonWidget = undefined;
+            b.init(@src(), .{}, .{ .gravity_y = 0.5, .padding = .all(6), .corners = .all(14), .label = .{ .text = "Attach" } });
+            b.processEvents();
+            b.drawBackground();
+            core.icon.icon(@src(), "attach", entypo.plus, .{ .fill_color = .{ .color = theme.color(.control, .text) } }, .{ .min_size_content = .{ .w = 14, .h = 14 } });
+            if (b.clicked()) {
+                attach_to = c.chat_id;
+                c.host.showOpenFileDialog(onAttach, &.{}, "", if (c.folder.len > 0) c.folder else null);
+            }
+            b.deinit();
+        }
+        // What the client offers to set, as compact dropdowns.
+        for (c.settings, 0..) |setting, n| drawSetting(c, setting, n);
     }
 
     var te: dvui.TextEntryWidget = undefined;
@@ -719,7 +741,6 @@ fn drawInput(c: *Chat) void {
         .max_size_content = .{ .w = std.math.floatMax(f32), .h = theme.font_body.lineHeight() * 6 },
     });
     // Enter sends; Shift+Enter is a new line, as the entry would make it.
-    var send_now = false;
     for (dvui.events()) |*e| {
         if (!te.matchEvent(e)) continue;
         if (e.evt == .key and e.evt.key.action == .down and e.evt.key.code == .enter and !e.evt.key.mod.shift()) {
@@ -730,7 +751,59 @@ fn drawInput(c: *Chat) void {
     te.processEvents();
     te.draw();
     te.deinit();
+
+    if (c.attached.items.len > 0) drawAttached(c);
     if (send_now and !c.busy and c.send(c.input.items)) c.input.clearRetainingCapacity();
+}
+
+/// The chat a file dialog's choice is for: the dialog's callback has no context of its own.
+var attach_to: ?api.ChatId = null;
+
+fn onAttach(paths: ?[][:0]const u8) void {
+    const id = attach_to orelse return;
+    attach_to = null;
+    const chosen = paths orelse return;
+    const c = Commands.chatFor(id) orelse return;
+    for (chosen) |p| c.attach(p);
+    sdk.host().refresh();
+}
+
+/// What is attached and not sent yet: a chip each, its name and an x to take it off.
+fn drawAttached(c: *Chat) void {
+    const theme = dvui.themeGet();
+    var row = dvui.flexbox(@src(), .{}, .{ .expand = .horizontal, .gravity_y = 1, .margin = .{ .h = 6 } });
+    defer row.deinit();
+    var remove: ?usize = null;
+    for (c.attached.items, 0..) |a, n| {
+        var chip = dvui.box(@src(), .{ .dir = .horizontal }, .{ .id_extra = n, .background = true, .color_fill = .{ .color = theme.color(.content, .fill) }, .corners = .all(10), .padding = .{ .x = 8, .y = 3, .w = 4, .h = 3 }, .margin = .{ .w = 6, .h = 4 } });
+        defer chip.deinit();
+        core.icon.icon(@src(), "attached", if (a.image()) entypo.image else entypo.text_document, .{ .fill_color = .{ .color = faded() } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
+        dvui.labelNoFmt(@src(), std.fs.path.basename(a.path), .{}, .{ .gravity_y = 0.5 });
+        if (dvui.buttonIcon(@src(), "Remove", entypo.cross, .{}, .{}, .{ .gravity_y = 0.5, .padding = .all(3), .corners = .all(8), .min_size_content = .{ .w = 10, .h = 10 }, .margin = .{ .x = 4 } })) remove = n;
+    }
+    if (remove) |n| c.detach(n);
+}
+
+/// One setting as a compact dropdown: its current choice's name, the rest a click away.
+fn drawSetting(c: *Chat, setting: api.Setting, n: usize) void {
+    const arena = dvui.currentWindow().arena();
+    const names = arena.alloc([]const u8, setting.choices.len) catch return;
+    var current: usize = 0;
+    for (setting.choices, names, 0..) |ch, *name, k| {
+        name.* = ch.name;
+        if (std.mem.eql(u8, ch.value, setting.current)) current = k;
+    }
+    if (names.len == 0) return;
+    var choice = current;
+    if (dvui.dropdown(@src(), names, .{ .choice = &choice }, .{}, .{
+        .id_extra = n,
+        .gravity_y = 0.5,
+        .margin = .{ .x = 6 },
+        .corners = .all(10),
+        .label = .{ .text = setting.name },
+    })) {
+        if (choice != current) c.chooseSetting(setting.id, setting.choices[choice].value);
+    }
 }
 
 fn drawUnavailable(c: *Chat) void {

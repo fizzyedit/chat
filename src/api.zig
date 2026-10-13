@@ -11,10 +11,10 @@
 //! `chat.update_tool` `{ chat, tool, update }`, `chat.set_plan` `{ chat, message, entries }`,
 //! `chat.ask` `{ chat, message, question }` → `{ question }`, `chat.set_busy` `{ chat, busy }`,
 //! `chat.set_title` `{ chat, title }`, `chat.set_resume` `{ chat, state }`, `chat.focus`
-//! `{ chat }`.
+//! `{ chat }`, `chat.set_settings` `{ chat, settings }`.
 //!
 //! **What the chat calls on a client**, `<client>.<name>`, when the client registered it:
-//! `chat_send` `{ chat, text, folder }`, `chat_answer` `{ chat, question, option }`, `chat_cancel`
+//! `chat_send` `{ chat, text, folder, attached }`, `chat_setting` `{ chat, id, value }`, `chat_answer` `{ chat, question, option }`, `chat_cancel`
 //! `{ chat }`, `chat_closed` `{ chat }`, `chat_resume` `{ chat, state }`, `chat_new` `{ folder }`.
 const std = @import("std");
 
@@ -110,6 +110,19 @@ pub const Question = struct {
     };
 };
 
+/// A setting of the conversation the other side offers (an agent's model, its permission mode):
+/// a dropdown by the message box. A choice goes back to the client (`chat_setting`); the client
+/// says what it is now with `chat.set_settings` again.
+pub const Setting = struct {
+    id: []const u8,
+    name: []const u8,
+    current: []const u8,
+    description: []const u8 = "",
+    choices: []const Choice = &.{},
+
+    pub const Choice = struct { value: []const u8, name: []const u8, description: []const u8 = "" };
+};
+
 /// Which streamed text a `chat.append_text` extends.
 pub const TextKind = enum(u8) { text, thought };
 
@@ -137,6 +150,11 @@ pub const Asked = struct { question: QuestionId };
 pub const SetBusy = struct { chat: ChatId, busy: bool };
 pub const SetTitle = struct { chat: ChatId, title: []const u8 };
 pub const SetResume = struct { chat: ChatId, state: []const u8 };
+/// A file to send with the chat's next message, as the person's + would attach it. `chat` 0: the
+/// chat in front.
+pub const Attach = struct { chat: ChatId = 0, path: []const u8 };
+/// The settings the chat offers by its message box, replacing any it had.
+pub const SetSettings = struct { chat: ChatId, settings: []const Setting = &.{} };
 pub const Focus = struct { chat: ChatId };
 
 /// To a client.
@@ -145,7 +163,11 @@ pub const Send = struct {
     text: []const u8,
     /// The project folder the chat is about (an agent works there); empty for none.
     folder: []const u8 = "",
+    /// What the person attached: images and files, by path.
+    attached: []const Block = &.{},
 };
+/// The person chose `value` for setting `id`.
+pub const Choose = struct { chat: ChatId, id: []const u8, value: []const u8 };
 pub const Answer = struct { chat: ChatId, question: QuestionId, option: []const u8 };
 pub const ChatOnly = struct { chat: ChatId };
 pub const Resume = struct { chat: ChatId, state: []const u8 };
