@@ -2,6 +2,6 @@
     .id = "chat",
     .name = "Chat",
     .version = "0.1.0",
-    .min_sdk_version = "0.2.23",
+    .min_sdk_version = "0.2.24",
     .description = "Talk to any AI agent that speaks the Agent Client Protocol (Claude, Codex, Gemini, Copilot, …) in a fizzy panel, and watch it work in fizzy through the agent plugin's tools.",
 }
