@@ -52,6 +52,8 @@ pub const State = struct {
         /// The widest line of a text-only message, for a bubble that hugs short text.
         natural_version: u32 = std.math.maxInt(u32),
         natural_w: f32 = 0,
+        /// Drawn last frame rather than stood in for by a spacer.
+        drawn: bool = false,
     };
 
     pub fn contentChanged(self: *State) void {
@@ -151,10 +153,15 @@ fn drawTranscript(c: *Chat) void {
             const valid = k.version == m.version and k.width == width and k.h > 0;
             if (valid and (y + k.h < top or y > bottom)) {
                 _ = dvui.spacer(@src(), .{ .min_size_content = .{ .h = k.h }, .expand = .horizontal, .id_extra = i });
+                k.drawn = false;
                 y += k.h;
                 continue;
             }
-            const h = drawMessage(c, i, m, width);
+            // Back from being a spacer, its row has no size from last frame (dvui forgets the
+            // widgets a frame did not draw) and would lay out empty for a frame, pulling everything
+            // below it up by its height and back: the jitter scrolling up. It keeps its height.
+            const h = drawMessage(c, i, m, width, if (valid and !k.drawn) k.h else 0);
+            k.drawn = true;
             k.version = m.version;
             k.width = width;
             if (h > 0) k.h = h;
@@ -169,11 +176,29 @@ fn drawTranscript(c: *Chat) void {
     // so scrolling up rubber-banded), and starts again only once they are back at the bottom.
     // The Output panel's rule (`OutputPanel.zig`).
     const max_y = @max(0, st.scroll.virtual_size.h - st.scroll.viewport.h);
+    const anchored = !st.follow and st.anchor_message < messages.len;
     if (st.follow) {
         if (st.scroll.viewport.y + 1.0 < st.set_y) st.follow = false;
     } else st.follow = st.scroll.offsetFromMax(.vertical) < 1.0;
     if (st.follow and st.scroll.viewport.y < max_y - 0.5) dvui.refresh(null, @src(), null);
-    // Where the reader is, in messages, for next frame.
+    // Where the reader is, in messages, for next frame. Scrolled up, the anchor moves only by what
+    // the person scrolled. A message above it that this frame laid out at a new height (one coming
+    // back into view settling its wrap) has already shifted what is on screen; finding the anchor
+    // again from the viewport would keep that shift, so every such message nudged the reader and
+    // scrolling up jittered. Kept as it was, next frame's `topOf` takes the new height and undoes it.
+    if (anchored) {
+        const kept = st.kept.items[0..messages.len];
+        st.anchor_offset += st.scroll.viewport.y - st.set_y;
+        while (st.anchor_offset < 0 and st.anchor_message > 0) {
+            st.anchor_message -= 1;
+            st.anchor_offset += kept[st.anchor_message].h;
+        }
+        while (st.anchor_message + 1 < kept.len and st.anchor_offset >= kept[st.anchor_message].h) {
+            st.anchor_offset -= kept[st.anchor_message].h;
+            st.anchor_message += 1;
+        }
+        return;
+    }
     var y: f32 = 10;
     for (st.kept.items[0..messages.len], 0..) |k, i| {
         if (y + k.h > st.scroll.viewport.y) {
@@ -229,8 +254,8 @@ fn drawHint(c: *Chat, width: f32) void {
 /// How long a new message takes to fade in, as written (through `core.motion.duration`).
 const fade_us = 220_000;
 
-fn drawMessage(c: *Chat, i: usize, m: *Transcript.Message, width: f32) f32 {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = i, .padding = .{ .x = side_pad, .y = 4, .w = side_pad, .h = 4 } });
+fn drawMessage(c: *Chat, i: usize, m: *Transcript.Message, width: f32, min_h: f32) f32 {
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = i, .padding = .{ .x = side_pad, .y = 4, .w = side_pad, .h = 4 }, .min_size_content = .{ .h = @max(0, min_h - 8) } });
     const id = row.data().id;
     const avail = @max(width - 2 * side_pad, 60);
     // A message that just arrived fades in. Only while it fades is it wrapped: a message drawn
