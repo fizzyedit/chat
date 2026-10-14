@@ -15,5 +15,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/acp.zig"),
     }) });
-    b.step("test", "Run the chat's tests").dependOn(&b.addRunArtifact(tests).step);
+    // The transcript and the contract's ZON: std-only too.
+    const transcript_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/Transcript.zig"),
+    }) });
+    const test_step = b.step("test", "Run the chat's tests");
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&b.addRunArtifact(transcript_tests).step);
 }

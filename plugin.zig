@@ -1,16 +1,21 @@
-//! Talk to AI agents in fizzy (fizzyedit/plans, `plans/AGENTS_PLAN.md`, "The chat plugin"). One
-//! chat for any agent: which one runs is a setting, a command line for an agent that speaks the
-//! Agent Client Protocol, and everything shown is the same for all of them.
+//! Conversations in fizzy, for any plugin (fizzyedit/plans, `plans/CHAT_PLAN.md`). The chat is to
+//! conversations what the workbench is to files: it owns the tabs, the transcripts, the list and
+//! how a conversation is drawn, and knows nothing of who is on the other end. A plugin with someone
+//! to talk to is a client: it registers and posts through the chat's commands (`src/api.zig`,
+//! `src/Commands.zig`), and the chat calls it back on its own.
 //!
 //! A conversation is a document: a `.chat` transcript, opened in a tab like any file
-//! (`src/Chat.zig`), several side by side if the person likes, each with its own agent. The
-//! sidebar lists them (`src/Explorer.zig`). The agent drives fizzy through the agent plugin's
-//! `fizzy-mcp`, handed to it when a session opens; nothing here imports that plugin. No agent runs
-//! until the person presses Start.
+//! (`src/Chat.zig`, drawn by `src/View.zig`), kept under its client's folder and listed under its
+//! client's group in the sidebar (`src/Explorer.zig`). Agents over ACP are a client here for now
+//! (`src/AcpClient.zig`), on their way to the agent plugin.
 const std = @import("std");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const Chat = @import("src/Chat.zig");
+const View = @import("src/View.zig");
+const Commands = @import("src/Commands.zig");
+const AcpClient = @import("src/AcpClient.zig");
+const Sample = @import("src/Sample.zig");
 const Explorer = @import("src/Explorer.zig");
 const Settings = @import("src/Settings.zig");
 const DocHandle = sdk.DocHandle;
@@ -66,8 +71,9 @@ var chats: std.AutoArrayHashMapUnmanaged(u64, *Chat) = .empty;
 
 pub fn register(host: *sdk.Host) !void {
     Schema.load(host, plugin_id, &settings);
-    Chat.settings = &settings;
+    AcpClient.settings = &settings;
     Chat.owner = &plugin;
+    Commands.chats = &chats;
     plugin.state = @ptrCast(&settings);
     try host.registerPlugin(&plugin);
     try Schema.register(host, &plugin, .{ .title = "Chat", .value = &settings });
@@ -79,34 +85,31 @@ pub fn register(host: *sdk.Host) !void {
         .keywords = sdk.keywords.ide.sidebar,
         .draw = drawExplorer,
     });
-    try host.registerCommand(.{
-        .id = sdk.Plugin.commandId("chat", "new"),
-        .owner = &plugin,
-        .title = "New Chat",
-        .run = cmdNew,
-        .icon = dvui.entypo.chat,
-    });
+    try Commands.register(host, &plugin);
+    // Clients of the chat, through its commands like any other plugin.
+    try AcpClient.register(host, &plugin);
+    if (@import("builtin").mode == .Debug) try Sample.register(host, &plugin);
 }
 
 fn drawExplorer(_: ?*anyopaque) anyerror!dvui.App.Result {
     return Explorer.draw(sdk.host());
 }
 
-fn cmdNew(_: *anyopaque) anyerror!void {
-    try Explorer.newChat(sdk.host());
-}
-
 fn beginFrame(_: *anyopaque) void {
-    for (chats.values()) |c| c.frame();
+    AcpClient.frame();
 }
 
 fn deinit(_: *anyopaque) void {
     const gpa = sdk.allocator();
     for (chats.values()) |c| {
+        Commands.closed(c);
+        View.release(c);
         c.deinit();
         gpa.destroy(c);
     }
     chats.deinit(gpa);
+    AcpClient.deinit(gpa);
+    Commands.deinit(gpa);
     Explorer.deinit(gpa);
 }
 
@@ -142,6 +145,8 @@ fn registerOpenDocument(_: *anyopaque, staged: *anyopaque) anyerror!*anyopaque {
     errdefer gpa.destroy(c);
     c.* = buf(staged).*;
     try chats.put(gpa, c.id, c);
+    Commands.adopt(c);
+    Commands.resumeChat(c);
     return c;
 }
 fn documentPtr(_: *anyopaque, id: u64) ?*anyopaque {
@@ -181,11 +186,13 @@ fn yes(_: *anyopaque, _: DocHandle) bool {
 }
 fn drawDocument(_: *anyopaque, handle: DocHandle) anyerror!void {
     const c = from(handle) orelse return;
-    _ = try c.draw();
+    _ = try View.draw(c);
 }
-/// Closing a chat's tab saves it and stops its agent; the transcript stays in the explorer.
+/// Closing a chat's tab saves it and tells its client; the transcript stays in the list.
 fn closeDocument(_: *anyopaque, handle: DocHandle) void {
     const c = from(handle) orelse return;
+    Commands.closed(c);
+    View.release(c);
     c.deinit();
     _ = chats.swapRemove(c.id);
     sdk.allocator().destroy(c);
@@ -211,6 +218,7 @@ fn restoreDocumentState(_: *anyopaque, handle: DocHandle, bytes: []const u8) any
     if (bytes.len < 1 or bytes[0] != state_version) return error.BadState;
     try c.reloadTranscript();
     c.host.documentTitleChanged(handle);
+    Commands.resumeChat(c);
     c.input.clearRetainingCapacity();
     try c.input.appendSlice(c.gpa, bytes[1..]);
 }
