@@ -83,7 +83,7 @@ pub fn newPath(host: *sdk.Host, client: []const u8, folder: []const u8) ![]u8 {
     var n: u32 = 0;
     const path = while (true) : (n += 1) {
         const name = try std.fmt.bufPrint(&name_buf, "{d:0>4}-{d:0>2}-{d:0>2}-{d:0>2}{d:0>2}{d:0>2}{s}.chat", .{
-            ymd.year, md.month.numeric(), md.day_index + 1, t.getHoursIntoDay(), t.getMinutesIntoHour(), t.getSecondsIntoMinute(),
+            ymd.year,                                                               md.month.numeric(), md.day_index + 1, t.getHoursIntoDay(), t.getMinutesIntoHour(), t.getSecondsIntoMinute(),
             if (n == 0) "" else try std.fmt.bufPrint(name_buf[48..], "-{d}", .{n}),
         });
         const p = try std.fs.path.join(gpa, &.{ client_dir, name });
