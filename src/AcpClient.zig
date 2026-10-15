@@ -838,12 +838,16 @@ fn askPermission(s: *Session, id: json.Value, params: json.Value) void {
     };
     const title = str(field(callv, "title")) orelse "use a tool";
     const m = turnMessage(s) orelse return rid.deinit(s.gpa);
-    const r = call("chat.ask", api.Ask{ .chat = s.chat, .message = m, .question = .{
-        // On its tool's line the call says what; on its own the question does.
-        .text = if (tid != null) "" else std.fmt.allocPrint(arena, "The agent asks to {s}.", .{readable(arena, title)}) catch "",
-        .options = options.items,
-        .tool = tid,
-    } }) orelse return rid.deinit(s.gpa);
+    const r = call("chat.ask", api.Ask{
+        .chat = s.chat,
+        .message = m,
+        .question = .{
+            // On its tool's line the call says what; on its own the question does.
+            .text = if (tid != null) "" else std.fmt.allocPrint(arena, "The agent asks to {s}.", .{readable(arena, title)}) catch "",
+            .options = options.items,
+            .tool = tid,
+        },
+    }) orelse return rid.deinit(s.gpa);
     const asked = api.parse(api.Asked, arena, r) catch return rid.deinit(s.gpa);
     s.requests.put(s.gpa, asked.question, rid) catch rid.deinit(s.gpa);
 }
