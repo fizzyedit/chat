@@ -15,7 +15,6 @@ const Chat = @import("src/Chat.zig");
 const View = @import("src/View.zig");
 const Commands = @import("src/Commands.zig");
 const AcpClient = @import("src/AcpClient.zig");
-const Sample = @import("src/Sample.zig");
 const Explorer = @import("src/Explorer.zig");
 const Settings = @import("src/Settings.zig");
 const DocHandle = sdk.DocHandle;
@@ -88,7 +87,6 @@ pub fn register(host: *sdk.Host) !void {
     try Commands.register(host, &plugin);
     // Clients of the chat, through its commands like any other plugin.
     try AcpClient.register(host, &plugin);
-    if (@import("builtin").mode == .Debug) try Sample.register(host, &plugin);
 }
 
 fn drawExplorer(_: ?*anyopaque) anyerror!dvui.App.Result {
