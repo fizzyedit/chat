@@ -156,6 +156,9 @@ pub const Attach = struct { chat: ChatId = 0, path: []const u8 };
 /// The settings the chat offers by its message box, replacing any it had.
 pub const SetSettings = struct { chat: ChatId, settings: []const Setting = &.{} };
 pub const Focus = struct { chat: ChatId };
+/// A chat in the list to delete, by its transcript's path (empty: the chat in front), as its
+/// row's Delete does: its tab closes, and its transcript and images go for good.
+pub const Delete = struct { path: []const u8 = "" };
 
 /// To a client.
 pub const Send = struct {

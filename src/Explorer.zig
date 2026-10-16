@@ -15,6 +15,7 @@ const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const core = @import("core");
 const Commands = @import("Commands.zig");
+const Chat = @import("Chat.zig");
 const api = @import("api.zig");
 
 const Row = struct {
@@ -31,6 +32,10 @@ var rows: std.ArrayListUnmanaged(Row) = .empty;
 /// Read the directory again before the next draw.
 var stale = true;
 var migrated = false;
+/// A chat asked to be deleted (its row's menu, `chat.delete`), deleted as the next frame begins
+/// (`frame`) rather than in the middle of this one, which may be drawing its tab. Owned by
+/// `host.allocator`.
+var doomed: ?[]u8 = null;
 
 /// Something on disk changed (a chat saved, made or removed, a client came or went): list again.
 pub fn changed() void {
@@ -46,6 +51,8 @@ pub fn deinit(gpa: std.mem.Allocator) void {
     }
     pluses.deinit(gpa);
     open.deinit(gpa);
+    if (doomed) |p| gpa.free(p);
+    doomed = null;
 }
 
 fn clear(gpa: std.mem.Allocator) void {
@@ -190,6 +197,51 @@ fn readHead(gpa: std.mem.Allocator, d: std.Io.Dir, name: []const u8) Head {
     const title = std.mem.trim(u8, if (std.mem.startsWith(u8, first, "//")) first[2..] else "", " \t\r");
     const folder = if (std.mem.startsWith(u8, second, "// folder ")) std.mem.trim(u8, second["// folder ".len..], " \t\r") else "";
     return .{ .title = gpa.dupe(u8, title) catch &.{}, .folder = gpa.dupe(u8, folder) catch &.{} };
+}
+
+/// Delete the chat at `path` as the next frame begins: only one the list holds, so nothing else on
+/// disk can be deleted this way (`chat.delete` takes any path). False when it is not in the list.
+pub fn delete(host: *sdk.Host, path: []const u8) bool {
+    if (stale) {
+        stale = false;
+        scan(host);
+    }
+    for (rows.items) |r| {
+        if (!std.mem.eql(u8, r.path, path)) continue;
+        const p = host.allocator.dupe(u8, path) catch return false;
+        if (doomed) |old| host.allocator.free(old);
+        doomed = p;
+        host.refresh();
+        return true;
+    }
+    return false;
+}
+
+/// Delete the chat at `path` as the file tree deletes a file (the workbench's `files.zig`, its
+/// row menu's Delete): at once and for good, with no question first. Its tab closes first, which
+/// tells its client (an agent's session ends with it) and saves it a last time; a tab that does
+/// not close (something is working on it, `sdk.Claim`) keeps its chat. Then its transcript and its
+/// images go.
+fn deleteChat(host: *sdk.Host, path: []const u8) void {
+    if (host.docFromPath(path)) |doc| {
+        host.closeDocById(doc.id) catch |err| return dvui.log.err("chat: could not close {s}: {t}", .{ path, err });
+        if (host.docFromPath(path) != null) return dvui.log.warn("chat: {s} is still open, so it stays", .{path});
+    }
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteFile(dvui.io, path) catch |err| return dvui.log.err("chat: could not delete {s}: {t}", .{ path, err });
+    if (Chat.imagesDir(host.allocator, path)) |images| {
+        defer host.allocator.free(images);
+        cwd.deleteTree(dvui.io, images) catch |err| dvui.log.warn("chat: could not delete {s}: {t}", .{ images, err });
+    } else |_| {}
+    changed();
+}
+
+/// At the start of a frame, before anything draws: a chat asked to be deleted goes now.
+pub fn frame(host: *sdk.Host) void {
+    const path = doomed orelse return;
+    doomed = null;
+    defer host.allocator.free(path);
+    deleteChat(host, path);
 }
 
 pub fn draw(host: *sdk.Host) !dvui.App.Result {
@@ -451,6 +503,24 @@ fn chatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, r: Row, selected: bo
     const branch = tree.branch(@src(), .{ .can_accept_children = false, .draggable = false, .branch_id = id }, rowOptions(id, selected));
     defer branch.deinit();
     core.anchor.mark(branch.button.data(), "chat.chat:{s}", .{r.path});
+    // Its right-click menu, as a file row's is.
+    {
+        var context = core.widgets.context(@src(), .{ .rect = branch.button.data().borderRectScale().r }, .{ .id_extra = id });
+        defer context.deinit();
+        if (context.activePoint()) |point| {
+            var menu = core.widgets.contextMenu(@src(), point, .{});
+            defer menu.deinit();
+            if (core.widgets.menuRow(@src(), "Open", .{ .icon = dvui.entypo.chat }) != null) {
+                _ = host.openFile(.{ .path = r.path }) catch {};
+                menu.close();
+            }
+            _ = dvui.separator(@src(), .{ .expand = .horizontal });
+            if (core.widgets.menuRow(@src(), "Delete", .{ .icon = dvui.entypo.trash }) != null) {
+                _ = delete(host, r.path);
+                menu.close();
+            }
+        }
+    }
     {
         var slot = core.widgets.treeRowGlyph(@src(), .{});
         slot.deinit();

@@ -80,7 +80,7 @@ pub fn fromBytes(path: []const u8, bytes: []const u8) !Chat {
     };
     errdefer self.deinitFields();
     if (std.mem.trim(u8, bytes, " \t\r\n").len > 0) {
-        const dir = try self.imagesDir(gpa);
+        const dir = try imagesDir(gpa, self.path);
         defer gpa.free(dir);
         if (self.transcript.load(bytes, dir, dvui.io)) |h| {
             defer gpa.free(h.client);
@@ -122,9 +122,9 @@ pub fn chatIdOf(path: []const u8) chat.ChatId {
     return h.final() | 1;
 }
 
-/// Where its images are kept: beside the transcript, in a folder of its name.
-pub fn imagesDir(self: *const Chat, gpa: std.mem.Allocator) ![]u8 {
-    const stem = if (std.mem.endsWith(u8, self.path, ".chat")) self.path[0 .. self.path.len - 5] else self.path;
+/// Where the images of the transcript at `path` are kept: beside it, in a folder of its name.
+pub fn imagesDir(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    const stem = if (std.mem.endsWith(u8, path, ".chat")) path[0 .. path.len - 5] else path;
     return std.fmt.allocPrint(gpa, "{s}.images", .{stem});
 }
 
@@ -142,7 +142,7 @@ pub fn save(self: *Chat) !void {
 pub fn write(self: *Chat) !void {
     var out: std.Io.Writer.Allocating = .init(self.gpa);
     defer out.deinit();
-    const dir = try self.imagesDir(self.gpa);
+    const dir = try imagesDir(self.gpa, self.path);
     defer self.gpa.free(dir);
     try self.transcript.save(&out.writer, .{ .client = self.client_id, .title = self.title.items, .folder = self.folder, .@"resume" = self.resume_state }, dir, dvui.io);
     if (std.fs.path.dirname(self.path)) |d| std.Io.Dir.cwd().createDirPath(dvui.io, d) catch {};

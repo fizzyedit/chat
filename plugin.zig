@@ -95,6 +95,7 @@ fn drawExplorer(_: ?*anyopaque) anyerror!dvui.App.Result {
 
 fn beginFrame(_: *anyopaque) void {
     AcpClient.frame();
+    Explorer.frame(sdk.host());
 }
 
 fn deinit(_: *anyopaque) void {
