@@ -6,7 +6,7 @@
 //!
 //! Only what is on screen is laid out. Each message keeps its height, keyed by the width and its
 //! version (`Transcript.Message.version`); one above or below the viewport is a spacer of that
-//! height. Streaming text bumps one message's version, so a frame of a turn re-lays that one.
+//! height, kept through a change of width until it comes into view. Streaming text bumps one message's version, so a frame of a turn re-lays that one.
 //! Scrolling is anchored to a message: at the bottom the view follows what arrives; scrolled up,
 //! it keeps the message being read where it is through any reflow (the sidebar opening, the
 //! window resizing, a tool's output opening).
@@ -52,6 +52,7 @@ pub const State = struct {
         /// The widest line of a text-only message, for a bubble that hugs short text.
         natural_version: u32 = std.math.maxInt(u32),
         natural_w: f32 = 0,
+        natural_max: f32 = 0,
         /// Drawn last frame rather than stood in for by a spacer.
         drawn: bool = false,
     };
@@ -130,7 +131,14 @@ fn drawTranscript(c: *Chat) void {
     st.seen = messages.len;
     if (st.history == null) st.history = messages.len;
 
-    const vh = st.scroll.viewport.h;
+    // The height the conversation has this frame, from a box made before the scroll area. The
+    // scroll area's own (`viewport.h`) is last frame's until it is made, and following the bottom
+    // from that while the pane grew taller put the viewport past the end: the newest line sat a
+    // frame behind the edge, and dvui's bounce back from the overshoot read as the person
+    // scrolling up, so following dropped and came back on alternate frames of the drag.
+    var area = dvui.box(@src(), .{}, .{ .expand = .both });
+    defer area.deinit();
+    const vh = area.data().contentRect().h;
     // Put the viewport where the reader is, before the scroll area reads it.
     if (st.follow) {
         st.scroll.viewport.y = @max(0, st.scroll.virtual_size.h - vh);
@@ -150,8 +158,12 @@ fn drawTranscript(c: *Chat) void {
         const bottom = st.scroll.viewport.y + 2 * @max(vh, 1);
         for (messages, 0..) |*m, i| {
             const k = &st.kept.items[i];
-            const valid = k.version == m.version and k.width == width and k.h > 0;
-            if (valid and (y + k.h < top or y > bottom)) {
+            // Off screen, a message stands in at the height it last had, even at another width: a
+            // drag of the pane's edge changes the width every frame, and laying the whole
+            // conversation out again on each one is what made resizing a long chat crawl. It is
+            // laid out at the new width when it comes into view, and the anchor holds the reader
+            // through that as through any reflow.
+            if (k.h > 0 and k.version == m.version and (y + k.h < top or y > bottom)) {
                 _ = dvui.spacer(@src(), .{ .min_size_content = .{ .h = k.h }, .expand = .horizontal, .id_extra = i });
                 k.drawn = false;
                 y += k.h;
@@ -159,8 +171,9 @@ fn drawTranscript(c: *Chat) void {
             }
             // Back from being a spacer, its row has no size from last frame (dvui forgets the
             // widgets a frame did not draw) and would lay out empty for a frame, pulling everything
-            // below it up by its height and back: the jitter scrolling up. It keeps its height.
-            const h = drawMessage(c, i, m, width, if (valid and !k.drawn) k.h else 0);
+            // below it up by its height and back: the jitter scrolling up, and on the first frame
+            // of a resize. It keeps its height for that frame, at whatever width it was measured.
+            const h = drawMessage(c, i, m, width, if (!k.drawn) k.h else 0);
             k.drawn = true;
             k.version = m.version;
             k.width = width;
@@ -318,10 +331,11 @@ fn drawBubble(c: *Chat, i: usize, m: *Transcript.Message, avail: f32) void {
 }
 
 /// A text-only message's widest line, so a short reply's bubble hugs it; anything richer takes
-/// the whole width.
+/// the whole width. Kept by version and by the width it was clamped to: kept by version alone, a
+/// message that arrived while the pane was narrow stayed that narrow after it widened.
 fn naturalWidth(c: *Chat, i: usize, m: *const Transcript.Message, max: f32) f32 {
     const k = &c.view.kept.items[i];
-    if (k.natural_version == m.version) return k.natural_w;
+    if (k.natural_version == m.version and k.natural_max == max) return k.natural_w;
     const font = dvui.themeGet().font_body;
     var w: f32 = 0;
     for (m.parts.items) |p| {
@@ -334,6 +348,7 @@ fn naturalWidth(c: *Chat, i: usize, m: *const Transcript.Message, max: f32) f32 
         if (w >= max) break;
     }
     k.natural_version = m.version;
+    k.natural_max = max;
     // Markdown's own paragraph padding and a little slack: a short message must never wrap.
     k.natural_w = @min(max, w + 28);
     return k.natural_w;
