@@ -134,6 +134,7 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
         .{ "focus", api.Focus, cmdFocus },
         .{ "set_settings", api.SetSettings, cmdSetSettings },
         .{ "attach", api.Attach, cmdAttach },
+        .{ "delete", api.Delete, cmdDelete },
     }) |entry| {
         try host.registerCommand(.{
             .id = "chat." ++ entry[0],
@@ -331,6 +332,11 @@ fn cmdAttach(a: api.Attach, call: *sdk.Command.Call) !void {
     std.Io.Dir.cwd().access(dvui.io, a.path, .{}) catch return call.fail("no file at {s}", .{a.path});
     c.attach(a.path);
     changed(c);
+}
+
+fn cmdDelete(a: api.Delete, call: *sdk.Command.Call) !void {
+    const path = if (a.path.len > 0) a.path else (front() orelse return call.fail("no chat is in front", .{})).path;
+    if (!Explorer.delete(sdk.host(), path)) return call.fail("no chat {s} is in the list", .{path});
 }
 
 fn cmdFocus(a: api.Focus, call: *sdk.Command.Call) !void {
