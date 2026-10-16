@@ -109,7 +109,7 @@ pub fn release(c: *Chat) void {
 }
 
 const side_pad = 14;
-const bubble_pad: dvui.Rect = .{ .x = 12, .y = 8, .w = 12, .h = 8 };
+const bubble_pad: dvui.Rect = .{ .x = 12, .y = 6, .w = 12, .h = 6 };
 
 pub fn draw(c: *Chat) !dvui.App.Result {
     var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .both });
@@ -292,7 +292,7 @@ fn drawHint(c: *Chat, width: f32) void {
 const fade_us = 220_000;
 
 fn drawMessage(c: *Chat, i: usize, m: *Transcript.Message, width: f32, min_h: f32) f32 {
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = i, .padding = .{ .x = side_pad, .y = 4, .w = side_pad, .h = 4 }, .min_size_content = .{ .h = @max(0, min_h - 8) } });
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = i, .padding = .{ .x = side_pad, .y = 3, .w = side_pad, .h = 3 }, .min_size_content = .{ .h = @max(0, min_h - 6) } });
     const id = row.data().id;
     const avail = @max(width - 2 * side_pad, 60);
     // A message that just arrived fades in. Only while it fades is it wrapped: a message drawn
@@ -424,7 +424,7 @@ fn markdown(c: *Chat, key: u64, text: []const u8, w: f32, id_extra: usize) void 
 
 fn drawThought(c: *Chat, key: u64, text: []const u8, w: f32, thinking: bool, id_extra: usize) void {
     const open = c.view.open.contains(key);
-    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = id_extra, .margin = .{ .y = 2, .h = 2 } });
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = id_extra });
     defer box.deinit();
     if (disclosure(@src(), if (thinking) "Thinking..." else "Thought", if (thinking) null else entypo.light_bulb, open, id_extra)) {
         if (open) _ = c.view.open.remove(key) else c.view.open.put(c.gpa, key, {}) catch {};
@@ -433,8 +433,9 @@ fn drawThought(c: *Chat, key: u64, text: []const u8, w: f32, thinking: bool, id_
     var tl = dvui.textLayout(@src(), .{}, .{
         .expand = .horizontal,
         .background = false,
-        .margin = .{ .x = 18 },
-        .max_size_content = .width(@max(w - 18, 20)),
+        .margin = .{ .x = 22 },
+        .padding = .{ .y = 2, .h = 4 },
+        .max_size_content = .width(@max(w - 22, 20)),
         .color_text = .{ .color = faded() },
     });
     defer tl.deinit();
@@ -445,7 +446,7 @@ fn drawThought(c: *Chat, key: u64, text: []const u8, w: f32, thinking: bool, id_
 /// label and a chevron. True when clicked.
 fn disclosure(src: std.builtin.SourceLocation, text: []const u8, tvg: ?[]const u8, open: bool, id_extra: usize) bool {
     var b: dvui.ButtonWidget = undefined;
-    b.init(src, .{}, .{ .id_extra = id_extra, .padding = .{ .y = 2, .h = 2 }, .corners = .all(6), .background = false });
+    b.init(src, .{}, .{ .id_extra = id_extra, .margin = .{}, .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 }, .corners = .all(6), .background = false });
     b.processEvents();
     b.drawBackground();
     {
@@ -455,7 +456,7 @@ fn disclosure(src: std.builtin.SourceLocation, text: []const u8, tvg: ?[]const u
         if (tvg) |icon| {
             core.icon.icon(@src(), "disclosure-icon", icon, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
         } else core.dialogs.bubbleSpinner(@src(), .{ .gravity_y = 0.5, .min_size_content = .{ .w = 14, .h = 14 }, .margin = .{ .w = 6 } }, .{});
-        dvui.labelNoFmt(@src(), text, .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = color } });
+        dvui.labelNoFmt(@src(), text, .{}, .{ .gravity_y = 0.5, .padding = .{ .w = 2 }, .color_text = .{ .color = color } });
         core.icon.icon(@src(), "disclosure-chevron", if (open) entypo.chevron_small_down else entypo.chevron_small_right, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } });
     }
     const clicked = b.clicked();
@@ -499,7 +500,7 @@ fn drawImage(img: Transcript.Block.Image, w: f32, id_extra: usize) void {
 fn drawFile(c: *Chat, path: []const u8, line: u32, title: []const u8, id_extra: usize) void {
     const theme = dvui.themeGet();
     var b: dvui.ButtonWidget = undefined;
-    b.init(@src(), .{}, .{ .id_extra = id_extra, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 }, .corners = .all(6), .margin = .{ .y = 2, .h = 2 } });
+    b.init(@src(), .{}, .{ .id_extra = id_extra, .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 }, .corners = .all(6), .margin = .{} });
     b.processEvents();
     b.drawBackground();
     {
@@ -509,8 +510,8 @@ fn drawFile(c: *Chat, path: []const u8, line: u32, title: []const u8, id_extra: 
         core.icon.icon(@src(), "file-link", entypo.text_document, .{ .fill_color = .{ .color = link } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
         const name = if (title.len > 0) title else std.fs.path.basename(path);
         if (line > 0) {
-            dvui.label(@src(), "{s}:{d}", .{ name, line }, .{ .gravity_y = 0.5, .color_text = .{ .color = link } });
-        } else dvui.labelNoFmt(@src(), name, .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = link } });
+            dvui.label(@src(), "{s}:{d}", .{ name, line }, .{ .gravity_y = 0.5, .padding = .{}, .color_text = .{ .color = link } });
+        } else dvui.labelNoFmt(@src(), name, .{}, .{ .gravity_y = 0.5, .padding = .{}, .color_text = .{ .color = link } });
     }
     if (b.clicked()) _ = c.host.openFile(.{ .path = path }) catch {};
     b.deinit();
@@ -543,13 +544,13 @@ fn drawDiff(path: []const u8, old: []const u8, new: []const u8, w: f32, id_extra
         .background = true,
         .color_fill = .{ .color = theme.color(.content, .fill).opacity(0.6) },
         .corners = .all(8),
-        .padding = .all(8),
-        .margin = .{ .y = 4, .h = 4 },
+        .padding = .all(6),
+        .margin = .{ .y = 3, .h = 3 },
         .max_size_content = .width(w - 16),
     });
     defer box.deinit();
-    dvui.label(@src(), "{s}  line {d}", .{ std.fs.path.basename(path), pre + 1 }, .{ .color_text = .{ .color = faded() } });
-    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .font = theme.font_mono, .max_size_content = .width(w - 16) });
+    dvui.label(@src(), "{s}  line {d}", .{ std.fs.path.basename(path), pre + 1 }, .{ .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 }, .color_text = .{ .color = faded() } });
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 }, .font = theme.font_mono, .max_size_content = .width(w - 16) });
     defer tl.deinit();
     const cap = 40;
     const minus = theme.color(.err, .text);
@@ -576,20 +577,20 @@ fn drawPlan(entries: []const Transcript.Block.PlanEntry, w: f32, id_extra: usize
         .background = true,
         .color_fill = .{ .color = theme.color(.content, .fill).opacity(0.5) },
         .corners = .all(8),
-        .padding = .all(8),
-        .margin = .{ .y = 4, .h = 4 },
+        .padding = .all(6),
+        .margin = .{ .y = 3, .h = 3 },
     });
     defer box.deinit();
     for (entries, 0..) |e, n| {
-        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = n, .margin = .{ .y = 1, .h = 1 } });
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .id_extra = n });
         defer row.deinit();
         const icon, const color = switch (e.status) {
             .completed => .{ entypo.check, theme.color(.highlight, .fill) },
             .in_progress => .{ entypo.dots_three_horizontal, theme.color(.content, .text) },
             .pending => .{ entypo.dot_single, faded() },
         };
-        core.icon.icon(@src(), "plan-mark", icon, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .y = 3, .w = 8 } });
-        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .max_size_content = .width(@max(w - 40, 20)), .color_text = if (e.status == .completed) .{ .color = faded() } else null });
+        core.icon.icon(@src(), "plan-mark", icon, .{ .fill_color = .{ .color = color } }, .{ .gravity_y = 0, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .y = 4, .w = 2 } });
+        var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 }, .max_size_content = .width(@max(w - 40, 20)), .color_text = if (e.status == .completed) .{ .color = faded() } else null });
         defer tl.deinit();
         tl.addText(e.text, .{});
     }
@@ -614,11 +615,11 @@ fn kindIcon(kind: api.Tool.Kind) []const u8 {
 fn drawTool(c: *Chat, tid: api.ToolId, w: f32) void {
     const theme = dvui.themeGet();
     const t = &c.transcript.tools.items[tid];
-    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = tid, .margin = .{ .y = 1, .h = 1 } });
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = tid });
     defer box.deinit();
     {
         var b: dvui.ButtonWidget = undefined;
-        b.init(@src(), .{}, .{ .expand = .horizontal, .padding = .{ .x = 4, .y = 3, .w = 4, .h = 3 }, .corners = .all(6), .background = false });
+        b.init(@src(), .{}, .{ .expand = .horizontal, .margin = .{}, .padding = .{ .x = 4, .y = 2, .w = 4, .h = 2 }, .corners = .all(6), .background = false });
         b.processEvents();
         b.drawBackground();
         {
@@ -634,7 +635,7 @@ fn drawTool(c: *Chat, tid: api.ToolId, w: f32) void {
                 .failed => core.icon.icon(@src(), "tool-failed", entypo.cross, .{ .fill_color = .{ .color = theme.color(.err, .text) } }, .{ .gravity_x = 1, .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 } }),
             }
             if (t.content.items.len > 0) core.icon.icon(@src(), "tool-open", if (t.open) entypo.chevron_small_down else entypo.chevron_small_right, .{ .fill_color = .{ .color = faded() } }, .{ .gravity_x = 1, .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 4 } });
-            dvui.labelNoFmt(@src(), t.title.items, .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = text_color }, .max_size_content = .width(@max(w - 60, 20)) });
+            dvui.labelNoFmt(@src(), t.title.items, .{}, .{ .gravity_y = 0.5, .padding = .{}, .color_text = .{ .color = text_color }, .max_size_content = .width(@max(w - 60, 20)) });
         }
         if (b.clicked() and t.content.items.len > 0) {
             t.open = !t.open;
@@ -645,7 +646,7 @@ fn drawTool(c: *Chat, tid: api.ToolId, w: f32) void {
     if (!t.open) return;
     var content = dvui.box(@src(), .{ .dir = .vertical }, .{
         .expand = .horizontal,
-        .margin = .{ .x = 20, .y = 2, .h = 4 },
+        .margin = .{ .x = 20, .y = 1, .h = 3 },
         .background = true,
         .color_fill = .{ .color = theme.color(.content, .fill).opacity(0.5) },
         .corners = .all(8),
@@ -672,7 +673,7 @@ fn drawOutput(text: []const u8, w: f32, id_extra: usize) void {
         end = text.len;
         break;
     }) + 1;
-    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .id_extra = id_extra, .font = dvui.themeGet().font_mono, .max_size_content = .width(w) });
+    var tl = dvui.textLayout(@src(), .{}, .{ .expand = .horizontal, .background = false, .padding = .{ .x = 6, .y = 2, .w = 6, .h = 2 }, .id_extra = id_extra, .font = dvui.themeGet().font_mono, .max_size_content = .width(w) });
     defer tl.deinit();
     tl.addText(std.mem.trimEnd(u8, text[0..@min(end, text.len)], "\n"), .{});
     if (end < text.len) {
@@ -684,7 +685,7 @@ fn drawOutput(text: []const u8, w: f32, id_extra: usize) void {
 fn drawQuestion(c: *Chat, qid: api.QuestionId, w: f32) void {
     const theme = dvui.themeGet();
     const q = &c.transcript.questions.items[qid];
-    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = qid, .margin = .{ .x = 20, .y = 2, .h = 4 } });
+    var box = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .id_extra = qid, .margin = .{ .x = 20, .y = 1, .h = 3 } });
     defer box.deinit();
     switch (q.answer) {
         .open => {
@@ -711,9 +712,9 @@ fn drawQuestion(c: *Chat, qid: api.QuestionId, w: f32) void {
             var row = dvui.box(@src(), .{ .dir = .horizontal }, .{});
             defer row.deinit();
             core.icon.icon(@src(), "answer", if (allowed) entypo.check else entypo.cross, .{ .fill_color = .{ .color = faded() } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 10, .h = 10 }, .margin = .{ .w = 6 } });
-            dvui.labelNoFmt(@src(), o.label, .{}, .{ .gravity_y = 0.5, .color_text = .{ .color = faded() }, .font = theme.font_body.larger(-1) });
+            dvui.labelNoFmt(@src(), o.label, .{}, .{ .gravity_y = 0.5, .padding = .{ .y = 2, .h = 2 }, .color_text = .{ .color = faded() }, .font = theme.font_body.larger(-1) });
         },
-        .cancelled => dvui.labelNoFmt(@src(), "Not answered", .{}, .{ .color_text = .{ .color = faded() }, .font = theme.font_body.larger(-1) }),
+        .cancelled => dvui.labelNoFmt(@src(), "Not answered", .{}, .{ .padding = .{ .y = 2, .h = 2 }, .color_text = .{ .color = faded() }, .font = theme.font_body.larger(-1) }),
     }
 }
 
@@ -721,7 +722,7 @@ fn drawQuestion(c: *Chat, qid: api.QuestionId, w: f32) void {
 
 fn drawTyping(c: *Chat, width: f32) void {
     _ = width;
-    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = side_pad, .y = 4, .w = side_pad, .h = 4 } });
+    var row = dvui.box(@src(), .{ .dir = .horizontal }, .{ .expand = .horizontal, .padding = .{ .x = side_pad, .y = 3, .w = side_pad, .h = 3 } });
     defer row.deinit();
     drawDots(c, 0);
 }
