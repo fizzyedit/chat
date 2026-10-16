@@ -40,10 +40,25 @@ settings: []chat.Setting = &.{},
 settings_arena: ?std.heap.ArenaAllocator = null,
 /// Files the person attached and has not sent yet: shown above the message box, sent with it.
 attached: std.ArrayListUnmanaged(Attachment) = .empty,
+/// What the person sent while a turn ran, oldest first: shown above the message box, and sent
+/// together as the next message when the turn ends (`sendQueued`).
+queued: std.ArrayListUnmanaged(Queued) = .empty,
 view: View.State = .{},
 /// The transcript's and the header's state when last written.
 saved_version: u64 = 0,
 header_dirty: bool = false,
+
+/// A message waiting for the turn to end: its text and what was attached to it, owned.
+pub const Queued = struct {
+    text: []u8,
+    attached: []Attachment,
+
+    fn deinit(self: Queued, gpa: std.mem.Allocator) void {
+        for (self.attached) |a| gpa.free(a.path);
+        gpa.free(self.attached);
+        gpa.free(self.text);
+    }
+};
 
 pub const Attachment = struct {
     path: []u8,
@@ -188,6 +203,8 @@ fn deinitFields(self: *Chat) void {
     if (self.settings_arena) |*a| a.deinit();
     for (self.attached.items) |a| self.gpa.free(a.path);
     self.attached.deinit(self.gpa);
+    for (self.queued.items) |q| q.deinit(self.gpa);
+    self.queued.deinit(self.gpa);
     self.view.deinit(self.gpa);
     self.transcript.deinit();
     self.input.deinit(self.gpa);
@@ -249,8 +266,15 @@ fn mimeOf(path: []const u8) []const u8 {
 /// What the person typed, to the chat's client: posted as theirs, then handed over. False when
 /// there is nothing to send or no client to send it to (the text stays where it was typed).
 pub fn send(self: *Chat, text: []const u8) bool {
+    if (!self.sendWith(text, self.attached.items)) return false;
+    for (self.attached.items) |a| self.gpa.free(a.path);
+    self.attached.clearRetainingCapacity();
+    return true;
+}
+
+fn sendWith(self: *Chat, text: []const u8, attached: []const Attachment) bool {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if ((trimmed.len == 0 and self.attached.items.len == 0) or !Commands.isRegistered(self.client_id)) return false;
+    if ((trimmed.len == 0 and attached.len == 0) or !Commands.isRegistered(self.client_id)) return false;
     // The message as the person sees it: their text, the images they attached shown, the files as
     // links. The client gets the same, by path.
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
@@ -259,7 +283,7 @@ pub fn send(self: *Chat, text: []const u8) bool {
     var shown: std.ArrayListUnmanaged(chat.Block) = .empty;
     var sent: std.ArrayListUnmanaged(chat.Block) = .empty;
     if (trimmed.len > 0) shown.append(arena, .{ .text = trimmed }) catch return false;
-    for (self.attached.items) |a| {
+    for (attached) |a| {
         if (a.image()) {
             const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, a.path, arena, .limited(32 * 1024 * 1024)) catch continue;
             shown.append(arena, .{ .image = .{ .mime = a.mime, .bytes = bytes, .alt = std.fs.path.basename(a.path) } }) catch {};
@@ -272,20 +296,87 @@ pub fn send(self: *Chat, text: []const u8) bool {
     _ = self.transcript.post(.person, shown.items) catch return false;
     // A chat is named by the first thing asked in it, unless its client names it.
     if (self.title.items.len == 0) {
-        const line = if (trimmed.len > 0) trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len] else std.fs.path.basename(self.attached.items[0].path);
+        const line = if (trimmed.len > 0) trimmed[0 .. std.mem.indexOfScalar(u8, trimmed, '\n') orelse trimmed.len] else std.fs.path.basename(attached[0].path);
         var buf: [64]u8 = undefined;
         const cut = if (line.len > 60) std.fmt.bufPrint(&buf, "{s}...", .{line[0..57]}) catch line[0..60] else line;
         self.setTitle(cut);
     }
     self.view.follow = true;
     Commands.callClient(self.client_id, "chat_send", chat.Send{ .chat = self.chat_id, .text = trimmed, .folder = self.folder, .attached = sent.items });
-    for (self.attached.items) |a| self.gpa.free(a.path);
-    self.attached.clearRetainingCapacity();
     return true;
 }
 
+/// While a turn runs: what the person typed, and what they attached, wait for it to end. ACP
+/// takes one prompt at a time (`session/prompt` answers when the turn is over), and so does every
+/// client here, so the chat keeps the queue, the same for all of them. False when there is
+/// nothing to queue.
+pub fn queue(self: *Chat, text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0 and self.attached.items.len == 0) return false;
+    const owned = self.gpa.dupe(u8, trimmed) catch return false;
+    const attached = self.attached.toOwnedSlice(self.gpa) catch {
+        self.gpa.free(owned);
+        return false;
+    };
+    self.queued.append(self.gpa, .{ .text = owned, .attached = attached }) catch {
+        (Queued{ .text = owned, .attached = attached }).deinit(self.gpa);
+        return false;
+    };
+    return true;
+}
+
+pub fn unqueue(self: *Chat, index: usize) void {
+    if (index >= self.queued.items.len) return;
+    self.queued.orderedRemove(index).deinit(self.gpa);
+}
+
+/// The turn is over: what queued goes as one message, its texts in the order they were written,
+/// as a person who kept typing would have sent them. Called at the top of each frame, never from
+/// inside a client's own call.
+pub fn sendQueued(self: *Chat) void {
+    if (self.busy or self.queued.items.len == 0) return;
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    var attached: std.ArrayListUnmanaged(Attachment) = .empty;
+    for (self.queued.items) |q| {
+        if (q.text.len > 0) {
+            if (text.items.len > 0) text.appendSlice(arena, "\n\n") catch return;
+            text.appendSlice(arena, q.text) catch return;
+        }
+        attached.appendSlice(arena, q.attached) catch return;
+    }
+    if (!self.sendWith(text.items, attached.items)) return;
+    for (self.queued.items) |q| q.deinit(self.gpa);
+    self.queued.clearRetainingCapacity();
+}
+
+/// Stop: the turn ends and what queued is not sent unasked. It goes back into the message box,
+/// ahead of what is being typed, to send or not.
 pub fn cancel(self: *Chat) void {
+    self.unsendQueued();
     Commands.callClient(self.client_id, "chat_cancel", chat.ChatOnly{ .chat = self.chat_id });
+}
+
+fn unsendQueued(self: *Chat) void {
+    if (self.queued.items.len == 0) return;
+    var text: std.ArrayList(u8) = .empty;
+    for (self.queued.items) |q| {
+        if (q.text.len > 0) {
+            text.appendSlice(self.gpa, q.text) catch return text.deinit(self.gpa);
+            text.appendSlice(self.gpa, "\n\n") catch return text.deinit(self.gpa);
+        }
+    }
+    text.appendSlice(self.gpa, self.input.items) catch return text.deinit(self.gpa);
+    self.input.deinit(self.gpa);
+    self.input = text;
+    for (self.queued.items) |q| {
+        for (q.attached) |a| self.attached.append(self.gpa, a) catch self.gpa.free(a.path);
+        self.gpa.free(q.attached);
+        self.gpa.free(q.text);
+    }
+    self.queued.clearRetainingCapacity();
 }
 
 /// The person chose `option` of question `qid`.

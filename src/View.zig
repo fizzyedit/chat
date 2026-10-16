@@ -738,7 +738,8 @@ fn drawDots(c: *Chat, id_extra: usize) void {
 
 /// The message box: what is attached, the text, and under it a row of what goes with the message:
 /// + to attach files and images, the client's settings (an agent's model, its mode) as dropdowns,
-/// and Send, or Stop while a turn runs.
+/// and Send, or Stop while a turn runs. While it runs, Enter queues the message instead (above
+/// the box, each with an x to take it back), and the queue goes when the turn ends.
 fn drawInput(c: *Chat) void {
     const theme = dvui.themeGet();
     var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .gravity_y = 1, .padding = .{ .x = 12, .y = 8, .w = 12, .h = 10 } });
@@ -793,7 +794,7 @@ fn drawInput(c: *Chat) void {
         .multiline = true,
         .break_lines = true,
         .text = .{ .array_list = .{ .backing = &c.input, .allocator = c.gpa, .limit = 64 * 1024 } },
-        .placeholder = "Message",
+        .placeholder = if (c.busy) "Queue a message for when this turn ends" else "Message",
     }, .{
         .expand = .horizontal,
         .gravity_y = 1,
@@ -816,7 +817,38 @@ fn drawInput(c: *Chat) void {
     te.deinit();
 
     if (c.attached.items.len > 0) drawAttached(c);
-    if (send_now and !c.busy and c.send(c.input.items)) c.input.clearRetainingCapacity();
+    if (c.queued.items.len > 0) drawQueued(c);
+    if (send_now) {
+        const done = if (c.busy) c.queue(c.input.items) else c.send(c.input.items);
+        if (done) c.input.clearRetainingCapacity();
+    }
+}
+
+/// What waits for the turn to end, oldest at the top: a quiet row each, its first line, how many
+/// files go with it, and an x to take it off.
+fn drawQueued(c: *Chat) void {
+    const theme = dvui.themeGet();
+    var col = dvui.box(@src(), .{ .dir = .vertical }, .{ .expand = .horizontal, .gravity_y = 1, .margin = .{ .h = 6 } });
+    defer col.deinit();
+    var remove: ?usize = null;
+    for (c.queued.items, 0..) |q, n| {
+        var row = dvui.box(@src(), .{ .dir = .horizontal }, .{
+            .expand = .horizontal,
+            .id_extra = n,
+            .background = true,
+            .color_fill = .{ .color = theme.color(.content, .fill).opacity(0.6) },
+            .corners = .all(10),
+            .padding = .{ .x = 8, .y = 2, .w = 4, .h = 2 },
+            .margin = .{ .h = 4 },
+        });
+        defer row.deinit();
+        core.icon.icon(@src(), "queued", entypo.back_in_time, .{ .fill_color = .{ .color = faded() } }, .{ .gravity_y = 0.5, .min_size_content = .{ .w = 12, .h = 12 }, .margin = .{ .w = 6 } });
+        if (dvui.buttonIcon(@src(), "Remove from the queue", entypo.cross, .{}, .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .padding = .all(3), .corners = .all(8), .min_size_content = .{ .w = 10, .h = 10 }, .margin = .{ .x = 4 } })) remove = n;
+        if (q.attached.len > 0) dvui.label(@src(), "+{d}", .{q.attached.len}, .{ .gravity_x = 1, .gravity_y = 0.5, .padding = .{ .x = 4, .w = 4 }, .color_text = .{ .color = faded() } });
+        const line = q.text[0 .. std.mem.indexOfScalar(u8, q.text, '\n') orelse q.text.len];
+        dvui.labelNoFmt(@src(), if (line.len > 0) line else "(attachments)", .{}, .{ .gravity_y = 0.5, .padding = .{ .y = 2, .h = 2 }, .color_text = .{ .color = faded() } });
+    }
+    if (remove) |n| c.unqueue(n);
 }
 
 /// The chat a file dialog's choice is for: the dialog's callback has no context of its own.
