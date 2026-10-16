@@ -45,6 +45,7 @@ pub fn deinit(gpa: std.mem.Allocator) void {
         gpa.free(p.folder);
     }
     pluses.deinit(gpa);
+    open.deinit(gpa);
 }
 
 fn clear(gpa: std.mem.Allocator) void {
@@ -223,6 +224,9 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
     }
 
     const active: []const u8 = if (host.activeDoc()) |doc| doc.owner.documentPath(doc) else "";
+    const active_hash = std.hash.Wyhash.hash(0, active);
+    const active_moved = active_hash != last_active;
+    last_active = active_hash;
     const open_folder = host.folder() orelse "";
     claimPluses(host);
     var tree = core.widgets.TreeWidget.tree(@src(), .{}, .{ .background = false, .expand = .horizontal });
@@ -231,9 +235,9 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
     for (clients.items) |client| {
         const live = Commands.isRegistered(client);
         const color = theme.color(.control, .text).opacity(if (live) 1 else 0.5);
-        const branch = groupBranch(tree, client, "", true, color, Commands.clientTitle(client) orelse client, null, if (live) "" else null);
+        const branch = groupBranch(tree, client, null, true, color, Commands.clientTitle(client) orelse client, null, if (live) "" else null);
         defer branch.deinit();
-        if (!branch.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal })) continue;
+        if (!expander(host, branch)) continue;
 
         if (!live) {
             var note = dvui.textLayout(@src(), .{}, .{ .background = false, .margin = .{ .x = indent }, .color_text = .{ .color = color }, .max_size_content = .width(@max(width - 40, 40)) });
@@ -252,9 +256,14 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
                 if (std.mem.eql(u8, r.client, client) and std.mem.eql(u8, r.folder, folder) and std.mem.eql(u8, r.path, active)) holds_active = true;
             }
             const name = if (folder.len > 0) std.fs.path.basename(folder) else "No folder";
+            // A chat just made active opens the groups it is in, once; then they are the person's.
+            if (holds_active and active_moved) {
+                open.put(host.allocator, groupId(client, null), true) catch {};
+                open.put(host.allocator, groupId(client, folder), true) catch {};
+            }
             const fb = groupBranch(tree, client, folder, holds_active or std.mem.eql(u8, folder, open_folder) or folders.items.len == 1, color, name, dvui.entypo.folder, if (live) folder else null);
             defer fb.deinit();
-            if (!fb.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal })) continue;
+            if (!expander(host, fb)) continue;
             for (rows.items) |r| {
                 if (!std.mem.eql(u8, r.client, client) or !std.mem.eql(u8, r.folder, folder)) continue;
                 chatRow(host, tree, r, std.mem.eql(u8, r.path, active), width);
@@ -326,12 +335,36 @@ fn claimPluses(host: *sdk.Host) void {
     pluses.clearRetainingCapacity();
 }
 
-/// A group's row: a client, or a folder under one. Its caret, its icon, its name, and a + at the
-/// right edge (`plus`: the folder a new chat goes in, "" for the open one; null for none).
-fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: []const u8, expanded: bool, color: dvui.Color, name: []const u8, icon: ?[]const u8, plus: ?[]const u8) *core.widgets.TreeWidget.Branch {
-    const id = idOf(&.{ client, folder, "group" });
+/// Whether each group is open, by row id. The tree takes `expanded` as where the row should be,
+/// every frame, and animates toward it whenever it differs from where the row is: a wish worked
+/// out afresh each frame (the folder holding the active chat) that disagreed with the person's
+/// last click restarted the fold every frame, and the group stuck a frame into it, its last rows
+/// cut off. So a group's wish only opens it the first time it is drawn, and after that the tree
+/// is handed back what it last was.
+var open: std.AutoHashMapUnmanaged(usize, bool) = .empty;
+/// The active chat's path, hashed, as last drawn: a group opens for it only when it changes.
+var last_active: u64 = 0;
+
+/// A group row's expander, its open state kept for the next frame's `groupBranch`.
+fn expander(host: *sdk.Host, branch: *core.widgets.TreeWidget.Branch) bool {
+    const expanded = branch.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal });
+    open.put(host.allocator, branch.init_options.branch_id.?, expanded) catch {};
+    return expanded;
+}
+
+/// A group row's id: a client's (`folder` null), or one of its folders' ("" is "No folder", which
+/// must not be taken for the client's own row).
+fn groupId(client: []const u8, folder: ?[]const u8) usize {
+    return if (folder) |f| idOf(&.{ client, f, "group" }) else idOf(&.{ client, "client" });
+}
+
+/// A group's row: a client (`folder` null), or a folder under one. Its caret, its icon, its name,
+/// and a + at the right edge (`plus`: the folder a new chat goes in, "" for the open one; null for
+/// none). `first_open`: whether it opens the first time it is drawn.
+fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: ?[]const u8, first_open: bool, color: dvui.Color, name: []const u8, icon: ?[]const u8, plus: ?[]const u8) *core.widgets.TreeWidget.Branch {
+    const id = groupId(client, folder);
     const branch = tree.branch(@src(), .{
-        .expanded = expanded,
+        .expanded = open.get(id) orelse first_open,
         .animation_duration = 300_000,
         .animation_easing = core.motion.enter,
         .can_accept_children = false,
