@@ -44,6 +44,13 @@ pub const State = struct {
     /// How much of each arriving text block is shown, by `partKey`: it runs to catch up with what
     /// has streamed in, so text arrives smoothly rather than in the agent's bursts.
     reveal: std.AutoHashMapUnmanaged(u64, f32) = .empty,
+    /// The widget in the transcript that has focus: the text the person last pressed in (a
+    /// paragraph, a note, a tool's output), or the scroll area after a click on empty space.
+    focused: ?dvui.Id = null,
+    /// A text that lost focus, whose selection goes at the top of the next frame (`beginFrame`).
+    deselect: ?dvui.Id = null,
+    /// `beginFrame` cleared a selection this frame.
+    deselected: bool = false,
 
     const Kept = struct {
         version: u32 = std.math.maxInt(u32),
@@ -138,6 +145,7 @@ fn drawTranscript(c: *Chat) void {
         st.scroll.viewport.y = @max(0, topOf(st, st.anchor_message) + st.anchor_offset);
     }
     st.set_y = st.scroll.viewport.y;
+    const focus_before = dvui.lastFocusedIdInFrame();
 
     var scroll = dvui.scrollArea(@src(), .{ .scroll_info = &st.scroll, .vertical_bar = .auto_overlay, .horizontal_bar = .hide }, .{ .expand = .both });
     const width = if (st.scroll.viewport.w > 0) st.scroll.viewport.w else scroll.data().contentRect().w;
@@ -170,6 +178,7 @@ fn drawTranscript(c: *Chat) void {
         if (c.busy and !streaming(c)) drawTyping(c, width);
     }
     scroll.deinit();
+    trackFocus(st, focus_before);
 
     // Following stops the moment the person scrolls up from where it was put (a wheel, a drag:
     // a trackpad's first step is a pixel or two, which a looser test snapped back to the bottom,
@@ -208,6 +217,34 @@ fn drawTranscript(c: *Chat) void {
         }
         y += k.h;
     }
+}
+
+/// A selection is one text's (dvui selects within one text layout, and markdown lays out each
+/// paragraph as its own), so the one the person made goes when they press anywhere else: in
+/// another message, on empty space, in the message box, elsewhere in fizzy. dvui keeps a text's
+/// selection when it loses focus, so the chat clears it, as a document's goes when you click away.
+fn trackFocus(st: *State, before: dvui.Id) void {
+    const now = dvui.lastFocusedIdInFrameSince(before);
+    if (st.focused) |old| if (now == null or now.? != old) {
+        st.deselect = old;
+        dvui.refresh(null, @src(), null);
+    };
+    st.focused = now;
+    // Told to select nothing, a text scrolls its cursor into view (dvui does for any selection
+    // it is given): the reader stays where they were.
+    if (st.deselected) {
+        st.deselected = false;
+        st.scroll.viewport.y = st.set_y;
+    }
+}
+
+/// The top of a frame: tell the text that lost focus to select nothing. Events go in before any
+/// widget runs, so this is the frame's start rather than where the chat draws.
+pub fn beginFrame(c: *Chat) void {
+    const id = c.view.deselect orelse return;
+    c.view.deselect = null;
+    _ = dvui.currentWindow().addEventTextSelect(.{ .start = 0, .end = 0, .target_id = id }) catch return;
+    c.view.deselected = true;
 }
 
 fn topOf(st: *const State, message: u32) f32 {
