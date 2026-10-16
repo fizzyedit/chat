@@ -231,12 +231,16 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
     claimPluses(host);
     var tree = core.widgets.TreeWidget.tree(@src(), .{}, .{ .background = false, .expand = .horizontal });
     defer tree.deinit();
+    // Each group's place in the palette, counted as the file tree counts its folders: a row takes
+    // the count as it is drawn, and a group moves it on once its rows are drawn.
+    var tint_i: usize = 0;
 
     for (clients.items) |client| {
         const live = Commands.isRegistered(client);
         const color = theme.color(.control, .text).opacity(if (live) 1 else 0.5);
-        const branch = groupBranch(tree, client, null, true, color, Commands.clientTitle(client) orelse client, null, if (live) "" else null);
+        const branch = groupBranch(host, tree, client, null, true, color, tint_i, Commands.clientTitle(client) orelse client, null, if (live) "" else null);
         defer branch.deinit();
+        defer tint_i += 1;
         if (!expander(host, branch)) continue;
 
         if (!live) {
@@ -261,19 +265,51 @@ pub fn draw(host: *sdk.Host) !dvui.App.Result {
                 open.put(host.allocator, groupId(client, null), true) catch {};
                 open.put(host.allocator, groupId(client, folder), true) catch {};
             }
-            const fb = groupBranch(tree, client, folder, holds_active or std.mem.eql(u8, folder, open_folder) or folders.items.len == 1, color, name, dvui.entypo.folder, if (live) folder else null);
+            const fb = groupBranch(host, tree, client, folder, holds_active or std.mem.eql(u8, folder, open_folder) or folders.items.len == 1, color, tint_i, name, dvui.entypo.folder, if (live) folder else null);
             defer fb.deinit();
+            defer tint_i += 1;
             if (!expander(host, fb)) continue;
             for (rows.items) |r| {
                 if (!std.mem.eql(u8, r.client, client) or !std.mem.eql(u8, r.folder, folder)) continue;
-                chatRow(host, tree, r, std.mem.eql(u8, r.path, active), width);
+                chatRow(host, tree, r, std.mem.eql(u8, r.path, active), tint_i, width);
             }
         }
     }
     return .ok;
 }
 
+// The file tree's look (the workbench's `files.zig`, `drawRow`), which fizzy's core does not
+// hold as a style of its own: its indent, row fills, label padding and fonts, and its icon tint.
 const indent = 14;
+/// The file tree's label padding: a row is as tall as its text and this, and no taller.
+const label_padding: dvui.Rect = .all(3);
+
+/// A row's text, as the file tree draws its names.
+fn rowLabel(src: std.builtin.SourceLocation, text: []const u8, color: dvui.Color, font: dvui.Font, opts: dvui.Options) void {
+    dvui.labelNoFmt(src, text, .{}, (dvui.Options{
+        .gravity_y = 0.5,
+        .padding = label_padding,
+        .margin = .all(0),
+        .color_text = .{ .color = color },
+        .font = font,
+    }).override(opts));
+}
+
+/// The file tree's icon colour: the row's palette colour (or the one a plugin gives that place,
+/// `Host.fileRowFillColor`), faded into the window by how far the pointer is from the row. An open
+/// group counts as its whole area, less the indent its rows sit in.
+fn tint(host: *sdk.Host, index: usize, rect: dvui.Rect.Physical, expanded: bool) dvui.Color {
+    const p = dvui.currentWindow().mouse_pt;
+    const max = if (expanded) rect.w / 8 else rect.h * 3;
+    const left = rect.x + if (expanded) indent * dvui.currentWindow().natural_scale else 0;
+    const right = rect.x + rect.w;
+    const bottom = rect.y + rect.h;
+    const dx: f32 = if (p.x < left) std.math.floatMax(f32) else if (p.x > right) p.x - right else 0;
+    const dy: f32 = if (p.y < rect.y) rect.y - p.y else if (p.y > bottom) p.y - bottom else 0;
+    const t = 1 - @sqrt(dx * dx + dy * dy) / max;
+    const color = host.fileRowFillColor(index) orelse core.palette.at(index);
+    return dvui.themeGet().color(.window, .fill).lerp(color, t);
+}
 
 fn contains(list: []const []const u8, s: []const u8) bool {
     for (list) |x| if (std.mem.eql(u8, x, s)) return true;
@@ -347,7 +383,7 @@ var last_active: u64 = 0;
 
 /// A group row's expander, its open state kept for the next frame's `groupBranch`.
 fn expander(host: *sdk.Host, branch: *core.widgets.TreeWidget.Branch) bool {
-    const expanded = branch.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal });
+    const expanded = branch.expander(@src(), .{ .indent = indent }, .{ .expand = .horizontal, .corners = .all(8) });
     open.put(host.allocator, branch.init_options.branch_id.?, expanded) catch {};
     return expanded;
 }
@@ -361,17 +397,20 @@ fn groupId(client: []const u8, folder: ?[]const u8) usize {
 /// A group's row: a client (`folder` null), or a folder under one. Its caret, its icon, its name,
 /// and a + at the right edge (`plus`: the folder a new chat goes in, "" for the open one; null for
 /// none). `first_open`: whether it opens the first time it is drawn.
-fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: ?[]const u8, first_open: bool, color: dvui.Color, name: []const u8, icon: ?[]const u8, plus: ?[]const u8) *core.widgets.TreeWidget.Branch {
+fn groupBranch(host: *sdk.Host, tree: *core.widgets.TreeWidget, client: []const u8, folder: ?[]const u8, first_open: bool, color: dvui.Color, tint_i: usize, name: []const u8, icon: ?[]const u8, plus: ?[]const u8) *core.widgets.TreeWidget.Branch {
     const id = groupId(client, folder);
     const branch = tree.branch(@src(), .{
         .expanded = open.get(id) orelse first_open,
-        .animation_duration = 300_000,
+        .animation_duration = 450_000,
         .animation_easing = core.motion.enter,
         .can_accept_children = false,
         .draggable = false,
         .branch_id = id,
     }, rowOptions(id, false));
-    core.widgets.treeCaret(@src(), branch.expanded, color);
+    // Named for a demo tape: `chat.group:<client>`, or `chat.group:<client>:<folder>`.
+    if (folder) |f| core.anchor.mark(branch.button.data(), "chat.group:{s}:{s}", .{ client, f }) else core.anchor.mark(branch.button.data(), "chat.group:{s}", .{client});
+    const glyph = tint(host, tint_i, branch.data().borderRectScale().r, branch.expanded).opacity(@as(f32, @floatFromInt(color.a)) / 255);
+    core.widgets.treeCaret(@src(), branch.expanded, glyph);
     if (plus) |plus_folder| {
         const theme = dvui.themeGet();
         var box = dvui.box(@src(), .{}, .{
@@ -398,36 +437,34 @@ fn groupBranch(tree: *core.widgets.TreeWidget, client: []const u8, folder: ?[]co
     }
     if (icon) |tvg| {
         var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
-        core.icon.icon(@src(), "chat-group", tvg, .{ .fill_color = .{ .color = color } }, core.widgets.treeRowIconOptions(.{}));
+        core.icon.icon(@src(), "chat-group", tvg, .{ .fill_color = .{ .color = glyph }, .stroke_color = .{ .color = glyph } }, core.widgets.treeRowIconOptions(.{}));
         slot.deinit();
     }
-    dvui.labelNoFmt(@src(), name, .{}, .{
-        .gravity_y = 0.5,
-        .color_text = .{ .color = color },
-        .font = if (icon == null) dvui.themeGet().font_body.withWeight(.bold) else null,
-    });
+    // A client heads its chats as the open folder heads the file tree, in the heading font.
+    rowLabel(@src(), name, color, dvui.Font.theme(if (icon == null) .heading else .body), .{});
     return branch;
 }
 
-fn chatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, r: Row, selected: bool, width: f32) void {
+fn chatRow(host: *sdk.Host, tree: *core.widgets.TreeWidget, r: Row, selected: bool, tint_i: usize, width: f32) void {
     const theme = dvui.themeGet();
     const id = idOf(&.{r.path});
     const branch = tree.branch(@src(), .{ .can_accept_children = false, .draggable = false, .branch_id = id }, rowOptions(id, selected));
     defer branch.deinit();
+    core.anchor.mark(branch.button.data(), "chat.chat:{s}", .{r.path});
     {
         var slot = core.widgets.treeRowGlyph(@src(), .{});
         slot.deinit();
     }
     {
         var slot = core.widgets.treeRowGlyph(@src(), .{ .margin = .{ .w = 2 } });
-        core.icon.icon(@src(), "chat-row", dvui.entypo.chat, .{ .fill_color = .{ .color = theme.color(.control, .text).opacity(0.7) } }, core.widgets.treeRowIconOptions(.{}));
+        const glyph = tint(host, tint_i, branch.data().borderRectScale().r, false);
+        core.icon.icon(@src(), "chat-row", dvui.entypo.chat, .{ .fill_color = .{ .color = glyph }, .stroke_color = .{ .color = glyph } }, core.widgets.treeRowIconOptions(.{}));
         slot.deinit();
     }
-    // When it last moved, at the right; the title takes what is left, on one line.
-    dvui.labelNoFmt(@src(), age(host.arena(), r.modified), .{}, .{ .gravity_x = 1, .gravity_y = 0.5, .color_text = .{ .color = theme.color(.control, .text).opacity(0.45) }, .font = theme.font_body.larger(-2) });
-    dvui.labelNoFmt(@src(), if (r.title.len > 0) r.title else "New chat", .{}, .{
-        .gravity_y = 0.5,
-        .color_text = .{ .color = theme.color(if (selected) .window else .control, .text) },
+    // When it last moved, at the right; the title takes what is left, on one line, brighter while
+    // the chat is open in a tab, as a file's name is.
+    rowLabel(@src(), age(host.arena(), r.modified), theme.color(.control, .text).opacity(0.45), dvui.Font.theme(.body).larger(-2), .{ .gravity_x = 1 });
+    rowLabel(@src(), if (r.title.len > 0) r.title else "New chat", theme.color(if (host.docFromPath(r.path) != null) .window else .control, .text), dvui.Font.theme(.body), .{
         .max_size_content = .width(@max(width - 110, 20)),
     });
     if (branch.button.clicked()) _ = host.openFile(.{ .path = r.path }) catch {};
