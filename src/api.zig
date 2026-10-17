@@ -182,8 +182,9 @@ pub const NewChat = struct { folder: []const u8 = "" };
 
 /// Parse a command's arguments, in `arena`.
 pub fn parse(comptime T: type, arena: std.mem.Allocator, zon: []const u8) !T {
-    const src = try arena.dupeZ(u8, std.mem.trim(u8, zon, " \t\r\n"));
-    return std.zon.parse.fromSliceAlloc(T, arena, src, null, .{ .ignore_unknown_fields = true });
+    const src = try arena.dupeSentinel(u8, std.mem.trim(u8, zon, " \t\r\n"), 0);
+    var diag: std.zon.parse.Diagnostics = undefined;
+    return std.zon.parse.fromSlice(T, .{ .gpa = arena, .arena = arena, .source = src, .diagnostics = &diag, .ignore_unknown_fields = true });
 }
 
 /// Write a command's arguments.

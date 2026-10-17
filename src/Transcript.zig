@@ -465,12 +465,13 @@ pub fn load(self: *Transcript, bytes: []const u8, images_dir: []const u8, io: st
     var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const source = try arena.dupeZ(u8, bytes);
+    const source = try arena.dupeSentinel(u8, bytes, 0);
     const Probe = struct { version: u32 = 1 };
-    const probe = std.zon.parse.fromSliceAlloc(Probe, arena, source, null, .{ .ignore_unknown_fields = true }) catch Probe{};
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const probe = std.zon.parse.fromSlice(Probe, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true }) catch Probe{};
     if (probe.version < format_version) return self.loadV1(arena, source);
 
-    const saved = try std.zon.parse.fromSliceAlloc(Saved, arena, source, null, .{ .ignore_unknown_fields = true });
+    const saved = try std.zon.parse.fromSlice(Saved, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true });
     for (saved.messages) |m| {
         try self.messages.append(self.gpa, .{ .author = m.author });
         const msg = &self.messages.items[self.messages.items.len - 1];
@@ -556,7 +557,8 @@ fn loadV1(self: *Transcript, arena: std.mem.Allocator, source: [:0]const u8) !Lo
         title: []const u8 = "",
         entries: []const struct { kind: Kind, text: []const u8, status: Status = .pending, detail: []const u8 = "" } = &.{},
     };
-    const old = try std.zon.parse.fromSliceAlloc(V1, arena, source, null, .{ .ignore_unknown_fields = true });
+    var diag: std.zon.parse.Diagnostics = undefined;
+    const old = try std.zon.parse.fromSlice(V1, .{ .gpa = arena, .arena = arena, .source = source, .diagnostics = &diag, .ignore_unknown_fields = true });
     var current: ?chat.MessageId = null;
     for (old.entries) |e| switch (e.kind) {
         .user => current = try self.post(.person, &.{.{ .text = e.text }}),
