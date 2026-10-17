@@ -92,6 +92,9 @@ const Session = struct {
     /// (`session/resume`), or load it, replaying its history (`session/load`).
     can_resume: bool = false,
     can_load: bool = false,
+    /// What `initialize` said the agent is called (`agentInfo`): the label its edits carry beside
+    /// the person's (`sdk.Author`). Owned; null until it says.
+    label: ?[]u8 = null,
     /// A `session/load` is replaying the conversation: the chat has it already, so the replay is
     /// not shown again.
     replaying: bool = false,
@@ -107,6 +110,7 @@ const Session = struct {
         if (self.queued) |*q| q.arena.deinit();
         if (self.resume_id) |r| self.gpa.free(r);
         if (self.folder) |f| self.gpa.free(f);
+        if (self.label) |l| self.gpa.free(l);
         self.pending.deinit(self.gpa);
         var it = self.tools.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
@@ -600,6 +604,11 @@ fn answered(s: *Session, what: Pending, result: json.Value) void {
             const caps = field(result, "agentCapabilities");
             s.can_load = if (field(caps, "loadSession")) |v| v == .bool and v.bool else false;
             s.can_resume = field(field(caps, "sessionCapabilities"), "resume") != null;
+            const info = field(result, "agentInfo");
+            if (str(field(info, "title")) orelse str(field(info, "name"))) |name| {
+                if (s.label) |l| s.gpa.free(l);
+                s.label = s.gpa.dupe(u8, name) catch null;
+            }
             openSession(s);
         },
         .session_new => {
@@ -881,8 +890,12 @@ fn writeFile(s: *Session, id: json.Value, params: json.Value) void {
     const text = str(field(params, "content")) orelse return write(s, acp.writeError, .{ id, -32602, "no content" });
     const host = sdk.host();
     const arena = host.arena();
-    if (host.docFromPath(path) != null and callText(arena, "text.write", .{ .path = path, .text = text }) != null) {
-        return write(s, acp.writeResult, .{ id, .{} });
+    if (host.docFromPath(path) != null) {
+        // The edit is this chat's agent's, not the person's: its step carries the agent's name.
+        const outer = host.act(.{ .kind = .agent, .plugin = "chat", .session = s.chat, .label = s.label orelse "An agent" });
+        const written = callText(arena, "text.write", .{ .path = path, .text = text });
+        host.endAct(outer);
+        if (written != null) return write(s, acp.writeResult, .{ id, .{} });
     }
     if (std.fs.path.dirname(path)) |dir| std.Io.Dir.cwd().createDirPath(dvui.io, dir) catch {};
     std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = path, .data = text }) catch |err|
