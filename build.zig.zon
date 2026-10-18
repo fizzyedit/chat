@@ -1,15 +1,15 @@
 .{
     .name = .chat,
     .version = "0.1.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "plugin.zig.zon", "src", "README.md" },
     .fingerprint = 0x659df2aa189488bc,
     .dependencies = .{
         .fizzy = .{
             // The published SDK, not a path into a checkout: a release has to build from a
             // clean clone. To build against a local fizzy: `zig build --fork=<fizzy>/sdk`.
-            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.26/fizzy-sdk-v0.2.26.tar.gz",
-            .hash = "fizzy-0.2.26-SGBwY8PFJADYTlbtNoDPd21a3l4Kwv0EF6Zcp--jzU81",
+            .url = "https://github.com/fizzyedit/fizzy/releases/download/sdk-v0.2.30/fizzy-sdk-v0.2.30.tar.gz",
+            .hash = "fizzy-0.2.30-SGBwY1QnJwDznUMVnSLATxXgH2e8_Vz7eMwLj9UQ0sVU",
         },
     },
 }
