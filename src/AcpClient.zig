@@ -511,7 +511,7 @@ fn findMcp(arena: std.mem.Allocator) ?[]const u8 {
     const host = sdk.host();
     const dir = host.pluginInstallDir("agent") orelse return null;
     defer host.allocator.free(dir);
-    const name = if (@import("builtin").os.tag == .windows) "fizzy-mcp.exe" else "fizzy-mcp";
+    const name = if (@import("builtin").target.os.tag == .windows) "fizzy-mcp.exe" else "fizzy-mcp";
     const path = std.fs.path.join(arena, &.{ dir, name }) catch return null;
     std.Io.Dir.accessAbsolute(dvui.io, path, .{ .execute = true }) catch return null;
     return path;

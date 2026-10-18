@@ -54,7 +54,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []co
 }
 
 fn spawn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []const u8) !std.process.Child {
-    if (comptime builtin.os.tag == .macos) {
+    if (comptime builtin.target.os.tag == .macos) {
         return core.darwin_spawn.spawn(gpa, .{
             .argv = argv,
             .cwd = cwd,
@@ -172,7 +172,7 @@ fn readStderr(self: *Agent) void {
 /// `name` on this process's PATH, then the login shell's; null for a path or when not found
 /// (the spawn then fails with the name as given). As `core/lsp/Client.zig`'s `resolveExecutable`.
 fn resolveExecutable(gpa: std.mem.Allocator, io: Io, name: []const u8) ?[]u8 {
-    if (comptime builtin.os.tag == .windows) return null;
+    if (comptime builtin.target.os.tag == .windows) return null;
     if (std.mem.indexOfScalar(u8, name, '/') != null) return null;
     const inherited: ?[]const u8 = if (std.c.getenv("PATH")) |p| std.mem.span(p) else null;
     if (findInPath(gpa, io, inherited, name)) |found| return found;
