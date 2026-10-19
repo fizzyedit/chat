@@ -49,7 +49,8 @@ pub const method_not_found = -32601;
 /// One message from the agent, by what it is.
 pub const Inbound = union(enum) {
     /// An answer to one of ours.
-    response: struct { id: i64, result: ?json.Value, err: ?[]const u8 },
+    /// `code` is the error's (`auth.auth_required`, say), 0 with a result.
+    response: struct { id: i64, result: ?json.Value, err: ?[]const u8, code: i64 = 0 },
     /// The agent asks something of us, and waits for `writeResult` / `writeError`.
     request: struct { id: json.Value, method: []const u8, params: json.Value },
     /// The agent tells us something (`session/update`).
@@ -78,7 +79,8 @@ pub const Inbound = union(enum) {
         };
         if (o.get("error")) |e| {
             const message: []const u8 = if (e == .object) if (e.object.get("message")) |m| (if (m == .string) m.string else "error") else "error" else "error";
-            return .{ .response = .{ .id = n, .result = null, .err = message } };
+            const code: i64 = if (e == .object) if (e.object.get("code")) |c| (if (c == .integer) c.integer else 0) else 0 else 0;
+            return .{ .response = .{ .id = n, .result = null, .err = message, .code = code } };
         }
         return .{ .response = .{ .id = n, .result = o.get("result") orelse .null, .err = null } };
     }
@@ -168,6 +170,7 @@ test "messages read as what they are" {
     try std.testing.expectEqual(@as(i64, 1), r.response.id);
     const e = Inbound.classify(try parse(a, "{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-1,\"message\":\"no\"}}"));
     try std.testing.expectEqualStrings("no", e.response.err.?);
+    try std.testing.expectEqual(@as(i64, -1), e.response.code);
     const q = Inbound.classify(try parse(a, "{\"jsonrpc\":\"2.0\",\"id\":\"p1\",\"method\":\"session/request_permission\",\"params\":{}}"));
     try std.testing.expectEqualStrings("session/request_permission", q.request.method);
     const n = Inbound.classify(try parse(a, "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{}}"));

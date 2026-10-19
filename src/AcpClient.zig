@@ -14,6 +14,7 @@ const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const api = @import("api.zig");
 const acp = @import("acp.zig");
+const auth = @import("auth.zig");
 const Agent = @import("Agent.zig");
 const Settings = @import("Settings.zig");
 const json = std.json;
@@ -23,8 +24,8 @@ pub var settings: *const Settings = undefined;
 
 var sessions: std.AutoArrayHashMapUnmanaged(api.ChatId, *Session) = .empty;
 
-const State = enum { idle, starting, ready, prompting, stopped };
-const Pending = enum { initialize, session_new, session_resume, session_load, prompt, set_option };
+const State = enum { idle, starting, ready, prompting, stopped, signing_in };
+const Pending = enum { initialize, session_new, session_resume, session_load, prompt, set_option, authenticate, logout };
 
 /// One block of a prompt, as ACP writes it: text, an image's bytes, or a link to a file.
 const Content = struct {
@@ -82,9 +83,15 @@ const Session = struct {
     pending: std.AutoHashMapUnmanaged(i64, Pending) = .empty,
     /// What the person sent before the agent was ready: sent once the session opens.
     queued: ?Queued = null,
+    /// The prompt the agent has, kept until it is taken: one refused for a sign-in is sent again
+    /// after it.
+    in_flight: ?Queued = null,
+    /// The command line the agent was started with: a terminal sign-in runs it again. Owned.
+    command_line: ?[]u8 = null,
     /// The chat's project folder, where the agent works; empty: the one fizzy has open.
     folder: ?[]u8 = null,
     has_mcp: bool = false,
+    mcp_noted: bool = false,
     /// The agent session this chat had (what it saved with `chat.set_resume`), to pick up again
     /// rather than start over: the agent keeps its own memory of the conversation.
     resume_id: ?[]u8 = null,
@@ -95,6 +102,14 @@ const Session = struct {
     /// What `initialize` said the agent is called (`agentInfo`): the label its edits carry beside
     /// the person's (`sdk.Author`). Owned; null until it says.
     label: ?[]u8 = null,
+    /// The agent's ways to sign in (`initialize`'s `authMethods`), in `auth_arena`, and whether it
+    /// takes `logout`.
+    methods: []const auth.Method = &.{},
+    auth_arena: ?std.heap.ArenaAllocator = null,
+    can_logout: bool = false,
+    /// A sign-in under way, and the question showing its methods.
+    sign_in: auth.Flow = .{},
+    sign_in_question: ?api.QuestionId = null,
     /// A `session/load` is replaying the conversation: the chat has it already, so the replay is
     /// not shown again.
     replaying: bool = false,
@@ -108,9 +123,11 @@ const Session = struct {
     fn deinit(self: *Session) void {
         self.disconnect();
         if (self.queued) |*q| q.arena.deinit();
+        if (self.command_line) |c| self.gpa.free(c);
         if (self.resume_id) |r| self.gpa.free(r);
         if (self.folder) |f| self.gpa.free(f);
         if (self.label) |l| self.gpa.free(l);
+        if (self.auth_arena) |*a| a.deinit();
         self.pending.deinit(self.gpa);
         var it = self.tools.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
@@ -129,6 +146,11 @@ const Session = struct {
         var it = self.requests.valueIterator();
         while (it.next()) |r| r.deinit(self.gpa);
         self.requests.clearRetainingCapacity();
+        if (self.in_flight) |*q| q.arena.deinit();
+        self.in_flight = null;
+        // A sign-in is for the agent that asked for it.
+        self.sign_in = .{};
+        self.sign_in_question = null;
         if (self.state != .idle) self.state = .stopped;
     }
 };
@@ -167,12 +189,20 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
         .{ "chat_resume", api.Resume, onResume },
         .{ "chat_setting", api.Choose, onSetting },
         .{ "chat_new", api.NewChat, onNew },
+        .{ "terminal_done", auth.Exited, onTerminalDone },
     }) |entry| try host.registerCommand(.{
         .id = client_id ++ "." ++ entry[0],
         .owner = owner,
         .title = "Agent: " ++ entry[0],
         .visibility = .internal,
         .runWith = Handler(entry[1], entry[2]).run,
+    });
+    try host.registerCommand(.{
+        .id = client_id ++ ".sign_out",
+        .owner = owner,
+        .title = "Chat: Sign Out of the Agent",
+        .run = signOut,
+        .isEnabled = canSignOut,
     });
     _ = call("chat.register", api.Register{ .client = client_id, .title = "Agents" });
 }
@@ -236,7 +266,8 @@ fn onSend(a: api.Send) void {
     s.queued = q;
     switch (s.state) {
         .ready => sendQueued(s),
-        .prompting => {},
+        // Sent once signed in and the session opens.
+        .prompting, .signing_in => {},
         .starting, .idle, .stopped => if (s.agent == null and s.launch == null) connect(s),
     }
 }
@@ -319,6 +350,10 @@ fn applyPreferred(s: *Session, options: ?json.Value) void {
 
 fn onAnswer(a: api.Answer) void {
     const s = sessions.get(a.chat) orelse return;
+    if (s.sign_in_question == a.question) {
+        s.sign_in_question = null;
+        return signIn(s, s.sign_in.chose(s.methods, a.option));
+    }
     const rid = (s.requests.fetchRemove(a.question) orelse return).value;
     defer rid.deinit(s.gpa);
     write(s, acp.writeResult, .{ rid.value(), .{ .outcome = .{ .outcome = "selected", .optionId = a.option } } });
@@ -326,6 +361,13 @@ fn onAnswer(a: api.Answer) void {
 
 fn onCancel(a: api.ChatOnly) void {
     const s = sessions.get(a.chat) orelse return;
+    // Stop while signing in (a browser left unanswered, a terminal left open): the agent stops
+    // too, and the next message starts it again.
+    if (s.state == .signing_in) {
+        note(s, "Stopped signing in.", .{});
+        s.disconnect();
+        return setBusy(s, false);
+    }
     cancel(s);
 }
 
@@ -398,6 +440,7 @@ fn wake() void {
 
 fn connect(s: *Session) void {
     s.disconnect();
+    s.mcp_noted = false;
     const line = std.mem.trim(u8, settings.agent_command.get(), " \t");
     if (line.len == 0) return fail(s, "No agent to run. Set one in Settings > Chat: a command line for an agent " ++
         "that speaks the Agent Client Protocol, such as `npx -y @agentclientprotocol/claude-agent-acp`.", .{});
@@ -414,6 +457,8 @@ fn connect(s: *Session) void {
         return fail(s, "Could not start the agent: no thread for it.", .{});
     };
     s.launch = launch;
+    if (s.command_line) |c| s.gpa.free(c);
+    s.command_line = s.gpa.dupe(u8, line) catch null;
     s.state = .starting;
     // Picking a session back up says so when it is open ("Picked up where you left off"); only a
     // new one is worth announcing as it starts.
@@ -439,8 +484,7 @@ fn launched(s: *Session) void {
     };
     request(s, .initialize, "initialize", .{
         .protocolVersion = acp.protocol_version,
-        // Files go through fizzy's open documents (`readFile`, `writeFile`). Terminals come later.
-        .clientCapabilities = .{ .fs = .{ .readTextFile = true, .writeTextFile = true }, .terminal = false },
+        .clientCapabilities = auth.clientCapabilities(sdk.host().hasCommand(auth.terminal_run)),
         .clientInfo = .{ .name = "fizzy", .title = "Fizzy", .version = "0.1.0" },
     });
 }
@@ -471,8 +515,10 @@ fn openSession(s: *Session) void {
             servers = arena.dupe(Server, &.{.{ .name = "fizzy", .command = mcp, .args = args, .env = &.{} }}) catch &.{};
             s.has_mcp = true;
         }
-    } else note(s, "fizzy-mcp was not found, so the agent cannot see or drive fizzy. Install the agent plugin, " ++
+    } else if (!s.mcp_noted) note(s, "fizzy-mcp was not found, so the agent cannot see or drive fizzy. Install the agent plugin, " ++
         "or name fizzy-mcp in Settings > Chat.", .{});
+    // Said once: a session started again after signing in need not say it twice.
+    s.mcp_noted = true;
     const cwd = workDir(s);
     // Pick up the session this chat had, when the agent can: continuing it as it is if it can,
     // else loading it (its history replays, and is not shown twice).
@@ -498,10 +544,17 @@ fn sessionOpen(s: *Session, id: []const u8, how: []const u8) void {
 }
 
 fn sendQueued(s: *Session) void {
-    var q = s.queued orelse return;
+    const q = s.queued orelse return;
     s.queued = null;
-    defer q.arena.deinit();
+    if (s.in_flight) |*old| old.arena.deinit();
+    s.in_flight = q;
     prompt(s, q.content);
+}
+
+/// The agent took the prompt (or refused it for good): it is not sent again.
+fn dropInFlight(s: *Session) void {
+    if (s.in_flight) |*q| q.arena.deinit();
+    s.in_flight = null;
 }
 
 /// The setting's fizzy-mcp, else the one beside the agent plugin.
@@ -584,7 +637,7 @@ fn handle(s: *Session, msg: acp.Inbound) void {
     switch (msg) {
         .response => |r| {
             const what = (s.pending.fetchRemove(r.id) orelse return).value;
-            if (r.err) |err| return refused(s, what, err);
+            if (r.err) |err| return refused(s, what, err, r.code);
             answered(s, what, r.result orelse .null);
         },
         .notification => |n| if (std.mem.eql(u8, n.method, "session/update")) update(s, n.params),
@@ -609,6 +662,10 @@ fn answered(s: *Session, what: Pending, result: json.Value) void {
                 if (s.label) |l| s.gpa.free(l);
                 s.label = s.gpa.dupe(u8, name) catch null;
             }
+            if (s.auth_arena) |*old| old.deinit();
+            s.auth_arena = .init(s.gpa);
+            s.methods = auth.methods(s.auth_arena.?.allocator(), result) catch &.{};
+            s.can_logout = auth.canLogout(result);
             openSession(s);
         },
         .session_new => {
@@ -623,7 +680,13 @@ fn answered(s: *Session, what: Pending, result: json.Value) void {
             publishSettings(s, field(result, "configOptions"));
         },
         .set_option => publishSettings(s, field(result, "configOptions")),
+        .authenticate => {
+            note(s, "Signed in to {s}.", .{agentName(s)});
+            signIn(s, s.sign_in.authenticated(true));
+        },
+        .logout => note(s, "Signed out of {s}. Its next session asks you to sign in again.", .{agentName(s)}),
         .prompt => {
+            dropInFlight(s);
             s.state = .ready;
             s.turn = null;
             if (str(field(result, "stopReason"))) |reason| {
@@ -634,7 +697,24 @@ fn answered(s: *Session, what: Pending, result: json.Value) void {
     }
 }
 
-fn refused(s: *Session, what: Pending, err: []const u8) void {
+fn refused(s: *Session, what: Pending, err: []const u8, code: i64) void {
+    // A session start (or, after a sign-out, a prompt) the agent wants a sign-in for: its ways in,
+    // as buttons.
+    switch (what) {
+        .session_new, .session_resume, .session_load, .prompt => if (s.sign_in.refused(code, s.methods) == .choose) {
+            s.replaying = false;
+            if (what == .prompt) {
+                s.turn = null;
+                // Sent again once signed in, unless the person has written something since.
+                if (s.queued == null) {
+                    s.queued = s.in_flight;
+                    s.in_flight = null;
+                } else dropInFlight(s);
+            }
+            return signIn(s, .choose);
+        },
+        else => {},
+    }
     switch (what) {
         .session_resume, .session_load => {
             // The agent no longer has it (another machine, cleared, too old): start over, and say
@@ -646,18 +726,123 @@ fn refused(s: *Session, what: Pending, err: []const u8) void {
             openSession(s);
         },
         .initialize, .session_new => {
-            // An agent that needs signing in says so here: its own CLI does that, once.
+            // Not a sign-in this chat can offer: a refusal of `initialize` (its methods come in
+            // its answer), or an agent with no methods.
             note(s, "The agent refused to start: {s}", .{err});
             s.disconnect();
             setBusy(s, false);
         },
         .prompt => {
+            dropInFlight(s);
             s.state = .ready;
             note(s, "{s}", .{err});
             setBusy(s, false);
         },
         .set_option => note(s, "The agent did not take that setting: {s}", .{err}),
+        .authenticate => {
+            note(s, "{s} did not sign in: {s}", .{ agentName(s), err });
+            signIn(s, s.sign_in.authenticated(false));
+        },
+        .logout => note(s, "{s} did not sign out: {s}", .{ agentName(s), err }),
     }
+}
+
+// ---- signing in -----------------------------------------------------------------------------
+
+fn agentName(s: *const Session) []const u8 {
+    return s.label orelse "The agent";
+}
+
+/// Carry out what the sign-in flow says comes next.
+fn signIn(s: *Session, action: auth.Flow.Action) void {
+    switch (action) {
+        .none, .give_up => {},
+        .choose => {
+            s.state = .signing_in;
+            // Not busy while the person chooses (which also closes what was asked before).
+            setBusy(s, false);
+            const arena = sdk.host().arena();
+            var options: std.ArrayListUnmanaged(api.Question.Option) = .empty;
+            var text: std.Io.Writer.Allocating = .init(arena);
+            text.writer.print("{s} needs you to sign in.", .{agentName(s)}) catch {};
+            // A terminal method only while a terminal can be opened for it.
+            const terminal = sdk.host().hasCommand(auth.terminal_run);
+            for (s.methods) |m| {
+                if (m.kind == .terminal and !terminal) continue;
+                options.append(arena, .{ .id = m.id, .label = m.name, .kind = .allow }) catch {};
+                if (m.description.len > 0) text.writer.print("\n{s}: {s}", .{ m.name, m.description }) catch {};
+            }
+            s.sign_in_question = askSignIn(s, text.written(), options.items);
+            if (s.sign_in_question == null) {
+                note(s, "{s} needs you to sign in, in a way this chat cannot offer here. Sign in with its own CLI, then send again.", .{agentName(s)});
+                s.disconnect();
+            }
+        },
+        .authenticate => |id| {
+            note(s, "Waiting for {s} to sign in...", .{agentName(s)});
+            setBusy(s, true);
+            request(s, .authenticate, "authenticate", auth.Authenticate{ .methodId = id });
+        },
+        .run_terminal => |m| runTerminal(s, m),
+        // A prompt refused after a sign-out has its session still: it is ready again.
+        .retry => if (s.session_id != null) {
+            s.state = .ready;
+            if (s.queued != null) sendQueued(s) else {
+                note(s, "Send your message again.", .{});
+                setBusy(s, false);
+            }
+        } else openSession(s),
+        .reconnect => connect(s),
+    }
+}
+
+/// The methods as buttons in the conversation; null when there are none, or they could not be
+/// shown.
+fn askSignIn(s: *Session, text: []const u8, options: []const api.Question.Option) ?api.QuestionId {
+    if (options.len == 0) return null;
+    const msg = post(s, .other, &.{}) orelse return null;
+    const r = call("chat.ask", api.Ask{ .chat = s.chat, .message = msg, .question = .{ .text = text, .options = options } }) orelse return null;
+    return (api.parse(api.Asked, sdk.host().arena(), r) catch return null).question;
+}
+
+/// A terminal method: the agent's own command with the method's arguments and environment, in a
+/// terminal the person types into. Its exit comes back as `agent.terminal_done`.
+fn runTerminal(s: *Session, m: auth.Method) void {
+    const arena = sdk.host().arena();
+    const command = acp.splitCommand(arena, s.command_line orelse "") catch &.{};
+    const argv = auth.terminalArgv(arena, command, m) catch &.{};
+    const run: auth.TerminalRun = .{
+        .title = std.fmt.allocPrint(arena, "Sign in: {s}", .{m.name}) catch m.name,
+        .argv = argv,
+        .env = m.env,
+        .cwd = workDir(s),
+        .done = client_id ++ ".terminal_done",
+        .tag = s.chat,
+    };
+    if (command.len == 0 or call(auth.terminal_run, run) == null) {
+        note(s, "Could not open a terminal to sign in to {s}.", .{agentName(s)});
+        return signIn(s, s.sign_in.exited(-1));
+    }
+    note(s, "Sign in to {s} in the terminal. The chat starts it again when that finishes.", .{agentName(s)});
+    setBusy(s, true);
+}
+
+fn onTerminalDone(a: auth.Exited) void {
+    const s = sessions.get(a.tag) orelse return;
+    if (a.code != 0) note(s, "The sign-in ended without signing in (exit {d}).", .{a.code});
+    signIn(s, s.sign_in.exited(a.code));
+}
+
+/// Whether an agent running in some chat takes `logout`.
+fn canSignOut(_: *anyopaque) bool {
+    for (sessions.values()) |s| if (s.agent != null and s.can_logout) return true;
+    return false;
+}
+
+/// Sign out of every running agent that takes it: signing out is the agent's, not one
+/// conversation's, and each chat runs its own agent.
+fn signOut(_: *anyopaque) anyerror!void {
+    for (sessions.values()) |s| if (s.agent != null and s.can_logout) request(s, .logout, "logout", auth.Logout{});
 }
 
 /// `session/update`: what the agent is saying, thinking and doing.
