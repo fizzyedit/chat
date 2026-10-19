@@ -15,6 +15,8 @@ const dvui = @import("dvui");
 const api = @import("api.zig");
 const acp = @import("acp.zig");
 const auth = @import("auth.zig");
+const permission = @import("permission.zig");
+const RequestId = permission.RequestId;
 const Agent = @import("Agent.zig");
 const Settings = @import("Settings.zig");
 const json = std.json;
@@ -115,12 +117,16 @@ const Session = struct {
     replaying: bool = false,
     /// This turn's message, made when the agent first says or does something in it.
     turn: ?api.MessageId = null,
-    /// The agent's `toolCallId`s and the steps they are in the chat; hidden ones map to null.
-    tools: std.StringHashMapUnmanaged(?api.ToolId) = .empty,
-    /// Questions asked for the agent's permission requests, and the request to answer.
-    requests: std.AutoHashMapUnmanaged(api.QuestionId, RequestId) = .empty,
+    /// The agent's `toolCallId`s, the steps they are in the chat (hidden ones have none) and
+    /// their kind, which a later permission request about them may leave out.
+    tools: std.StringHashMapUnmanaged(Known) = .empty,
+    /// Questions asked for the agent's permission requests, and the request each answers.
+    requests: permission.Requests = .{},
 
     fn deinit(self: *Session) void {
+        // The chat is closed: its questions have nowhere to close, and the agent stops anyway.
+        self.requests.deinit(self.gpa);
+        self.requests = .{};
         self.disconnect();
         if (self.queued) |*q| q.arena.deinit();
         if (self.command_line) |c| self.gpa.free(c);
@@ -132,10 +138,12 @@ const Session = struct {
         var it = self.tools.keyIterator();
         while (it.next()) |k| self.gpa.free(k.*);
         self.tools.deinit(self.gpa);
-        self.requests.deinit(self.gpa);
     }
 
     fn disconnect(self: *Session) void {
+        // Each request waiting is answered before the agent goes, and its buttons go: they
+        // would answer nothing.
+        dropRequests(self, true);
         if (self.launch) |l| l.abandon(self.gpa);
         self.launch = null;
         if (self.agent) |a| a.stop();
@@ -143,9 +151,6 @@ const Session = struct {
         self.pending.clearRetainingCapacity();
         if (self.session_id) |s| self.gpa.free(s);
         self.session_id = null;
-        var it = self.requests.valueIterator();
-        while (it.next()) |r| r.deinit(self.gpa);
-        self.requests.clearRetainingCapacity();
         if (self.in_flight) |*q| q.arena.deinit();
         self.in_flight = null;
         // A sign-in is for the agent that asked for it.
@@ -155,27 +160,13 @@ const Session = struct {
     }
 };
 
-/// An agent's request id, kept to answer it: a number or a string, as the agent wrote it.
-const RequestId = union(enum) {
-    int: i64,
-    str: []u8,
-
-    fn of(gpa: std.mem.Allocator, v: json.Value) ?RequestId {
-        return switch (v) {
-            .integer => |n| .{ .int = n },
-            .string => |s| .{ .str = gpa.dupe(u8, s) catch return null },
-            else => null,
-        };
-    }
-    fn value(self: RequestId) json.Value {
-        return switch (self) {
-            .int => |n| .{ .integer = n },
-            .str => |s| .{ .string = s },
-        };
-    }
-    fn deinit(self: RequestId, gpa: std.mem.Allocator) void {
-        if (self == .str) gpa.free(self.str);
-    }
+/// A tool call the agent started: its step in the chat (none for a hidden one), and its kind.
+const Known = struct {
+    tool: ?api.ToolId,
+    kind: api.Tool.Kind,
+    /// Whether its step shows content: a permission request adds the call's detail only to a step
+    /// with none, rather than replace what is there.
+    has_content: bool = false,
 };
 
 // ---- the chat's side ------------------------------------------------------------------------
@@ -354,7 +345,7 @@ fn onAnswer(a: api.Answer) void {
         s.sign_in_question = null;
         return signIn(s, s.sign_in.chose(s.methods, a.option));
     }
-    const rid = (s.requests.fetchRemove(a.question) orelse return).value;
+    const rid = s.requests.take(a.question) orelse return;
     defer rid.deinit(s.gpa);
     write(s, acp.writeResult, .{ rid.value(), .{ .outcome = .{ .outcome = "selected", .optionId = a.option } } });
 }
@@ -581,13 +572,19 @@ fn prompt(s: *Session, blocks: []const Content) void {
 fn cancel(s: *Session) void {
     const session = s.session_id orelse return;
     if (s.state != .prompting) return;
-    var it = s.requests.valueIterator();
-    while (it.next()) |r| {
-        write(s, acp.writeResult, .{ r.value(), .{ .outcome = .{ .outcome = "cancelled" } } });
-        r.deinit(s.gpa);
-    }
-    s.requests.clearRetainingCapacity();
+    // ACP: a cancelled turn answers each permission request it left waiting `cancelled`.
+    dropRequests(s, true);
     write(s, acp.writeNotification, .{ "session/cancel", .{ .sessionId = session } });
+}
+
+/// Every permission request still waiting, answered `cancelled` (unless the agent is gone:
+/// `answer` false), its question closed in the chat.
+fn dropRequests(s: *Session, answer: bool) void {
+    while (s.requests.pop()) |e| {
+        if (answer) write(s, acp.writeResult, .{ e.request.value(), .{ .outcome = .{ .outcome = "cancelled" } } });
+        e.request.deinit(s.gpa);
+        _ = call("chat.unask", api.Unask{ .chat = s.chat, .question = e.question });
+    }
 }
 
 fn request(s: *Session, what: Pending, method: []const u8, params: anytype) void {
@@ -624,6 +621,8 @@ fn frameSession(s: *Session) void {
         var buf: [600]u8 = undefined;
         const why = std.mem.trim(u8, agent.stderrTail(&buf), " \t\r\n");
         if (why.len > 0) note(s, "The agent stopped:\n\n```\n{s}\n```", .{why}) else note(s, "The agent stopped.", .{});
+        // Its requests went with it: nothing to answer, only buttons to take away.
+        dropRequests(s, false);
         s.disconnect();
         setBusy(s, false);
         if (s.queued) |*q| {
@@ -856,7 +855,7 @@ fn update(s: *Session, params: json.Value) void {
     } else if (std.mem.eql(u8, kind, "agent_thought_chunk")) {
         content(s, field(u, "content"), .thought);
     } else if (std.mem.eql(u8, kind, "tool_call")) {
-        toolCall(s, u);
+        _ = toolCall(s, u);
     } else if (std.mem.eql(u8, kind, "tool_call_update")) {
         toolUpdate(s, u);
     } else if (std.mem.eql(u8, kind, "config_option_update")) {
@@ -984,66 +983,116 @@ fn toolContent(arena: std.mem.Allocator, u: json.Value) ?[]const api.Block {
     return if (any) out.items else null;
 }
 
-fn toolCall(s: *Session, u: json.Value) void {
-    const id = str(field(u, "toolCallId")) orelse return;
-    const title = str(field(u, "title")) orelse "A tool";
-    const key = s.gpa.dupe(u8, id) catch return;
-    if (hidden(title)) {
-        s.tools.put(s.gpa, key, null) catch s.gpa.free(key);
-        return;
+/// A tool call's step in the chat, made now; a call the chat has already is updated instead
+/// (a permission request can come before its `tool_call`, which then repeats it).
+fn toolCall(s: *Session, u: json.Value) ?Known {
+    const id = str(field(u, "toolCallId")) orelse return null;
+    if (s.tools.get(id)) |known| {
+        toolUpdate(s, u);
+        return known;
     }
-    const m = turnMessage(s) orelse return s.gpa.free(key);
+    const title = str(field(u, "title")) orelse "A tool";
+    const kind = toolKind(str(field(u, "kind")));
     const arena = sdk.host().arena();
-    const r = call("chat.tool", api.AddTool{ .chat = s.chat, .message = m, .tool = .{
-        .kind = toolKind(str(field(u, "kind"))),
+    const given = toolContent(arena, u) orelse &.{};
+    const key = s.gpa.dupe(u8, id) catch return null;
+    if (hidden(title)) {
+        s.tools.put(s.gpa, key, .{ .tool = null, .kind = kind }) catch s.gpa.free(key);
+        return null;
+    }
+    const m = turnMessage(s) orelse {
+        s.gpa.free(key);
+        return null;
+    };
+    const added: ?api.Added = if (call("chat.tool", api.AddTool{ .chat = s.chat, .message = m, .tool = .{
+        .kind = kind,
         .title = readable(arena, title),
         .status = toolStatus(str(field(u, "status"))) orelse .pending,
-        .content = toolContent(arena, u) orelse &.{},
-    } }) orelse return s.gpa.free(key);
-    const added = api.parse(api.Added, arena, r) catch return s.gpa.free(key);
-    s.tools.put(s.gpa, key, added.tool) catch s.gpa.free(key);
+        .content = given,
+    } })) |r| api.parse(api.Added, arena, r) catch null else null;
+    const known: Known = .{ .tool = (added orelse {
+        s.gpa.free(key);
+        return null;
+    }).tool, .kind = kind, .has_content = given.len > 0 };
+    s.tools.put(s.gpa, key, known) catch s.gpa.free(key);
+    return known;
 }
 
 fn toolUpdate(s: *Session, u: json.Value) void {
-    const tid = (s.tools.get(str(field(u, "toolCallId")) orelse return) orelse return) orelse return;
+    const known = s.tools.getPtr(str(field(u, "toolCallId")) orelse return) orelse return;
+    if (str(field(u, "kind"))) |k| known.kind = toolKind(k);
+    const tid = known.tool orelse return;
     const arena = sdk.host().arena();
+    const given = toolContent(arena, u);
+    if (given) |c| known.has_content = c.len > 0;
     _ = call("chat.update_tool", api.UpdateTool{ .chat = s.chat, .tool = tid, .update = .{
         .title = if (str(field(u, "title"))) |t| readable(arena, t) else null,
         .status = toolStatus(str(field(u, "status"))),
-        .content = toolContent(arena, u),
+        .content = given,
     } });
 }
 
-/// `session/request_permission`: buttons on the tool call it is about, the agent's own options.
+/// `session/request_permission`: buttons on the tool call it is about, the agent's own options,
+/// and one line saying what the call would do (the command, the file and how much of it, the
+/// path), with the detail behind the step's disclosure. A call the chat has not seen yet becomes
+/// a step now, so the request always has one to show.
 fn askPermission(s: *Session, id: json.Value, params: json.Value) void {
     const rid = RequestId.of(s.gpa, id) orelse return;
     const arena = sdk.host().arena();
-    const callv = field(params, "toolCall");
-    const tid: ?api.ToolId = if (str(field(callv, "toolCallId"))) |tc| (s.tools.get(tc) orelse null) orelse null else null;
+    const callv = field(params, "toolCall") orelse .null;
+    const tcid = str(field(callv, "toolCallId")) orelse "";
+    const before: ?*Known = s.tools.getPtr(tcid);
+    // A call the chat has not seen is made a step now, with what the request says of it.
+    const known: ?Known = if (before) |k| k.* else toolCall(s, callv);
+    const kind = if (str(field(callv, "kind"))) |k| toolKind(k) else if (known) |k| k.kind else .other;
+    const title = readable(arena, str(field(callv, "title")) orelse "use a tool");
+    // The step's disclosure, in one update: the content the request gives (an empty list never
+    // wipes what the step shows), and the whole command or the call's input where the step would
+    // otherwise say nothing about it.
+    if (known) |k| if (k.tool) |tid| {
+        const given = toolContent(arena, callv) orelse &.{};
+        const extra = if (given.len > 0 or !k.has_content) permission.detail(arena, callv, kind) else null;
+        var blocks: std.ArrayListUnmanaged(api.Block) = .empty;
+        // A step made just now has the given content already.
+        if (before != null) blocks.appendSlice(arena, given) catch {};
+        if (extra) |e| blocks.append(arena, e) catch {};
+        if (blocks.items.len > 0) {
+            if (before == null) blocks.insertSlice(arena, 0, given) catch {};
+            _ = call("chat.update_tool", api.UpdateTool{ .chat = s.chat, .tool = tid, .update = .{
+                .title = if (before != null and str(field(callv, "title")) != null) title else null,
+                .content = blocks.items,
+            } });
+            if (s.tools.getPtr(tcid)) |p| p.has_content = true;
+        }
+    };
     var options: std.ArrayListUnmanaged(api.Question.Option) = .empty;
     if (field(params, "options")) |opts| if (opts == .array) for (opts.array.items) |o| {
         const oid = str(field(o, "optionId")) orelse continue;
-        const kind = str(field(o, "kind")) orelse "";
+        const okind = str(field(o, "kind")) orelse "";
         options.append(arena, .{
             .id = oid,
             .label = str(field(o, "name")) orelse oid,
-            .kind = if (std.mem.eql(u8, kind, "allow_once")) .allow else if (std.mem.eql(u8, kind, "allow_always")) .allow_always else if (std.mem.eql(u8, kind, "reject_once")) .deny else if (std.mem.eql(u8, kind, "reject_always")) .deny_always else .neutral,
+            .kind = if (std.mem.eql(u8, okind, "allow_once")) .allow else if (std.mem.eql(u8, okind, "allow_always")) .allow_always else if (std.mem.eql(u8, okind, "reject_once")) .deny else if (std.mem.eql(u8, okind, "reject_always")) .deny_always else .neutral,
         }) catch {};
     };
-    const title = str(field(callv, "title")) orelse "use a tool";
+    // Paths are written relative to a project folder only: relative to home they would mislead.
+    const project = s.folder orelse sdk.host().folder() orelse "";
+    const line = permission.summary(arena, callv, kind, title, project);
+    const tool: ?api.ToolId = if (known) |k| k.tool else null;
     const m = turnMessage(s) orelse return rid.deinit(s.gpa);
     const r = call("chat.ask", api.Ask{
         .chat = s.chat,
         .message = m,
         .question = .{
-            // On its tool's line the call says what; on its own the question does.
-            .text = if (tid != null) "" else std.fmt.allocPrint(arena, "The agent asks to {s}.", .{readable(arena, title)}) catch "",
+            // On its step's line a summary that only repeats the title says nothing more; on its
+            // own the question says it is one.
+            .text = if (!std.mem.eql(u8, line, title)) line else if (tool != null) "" else std.fmt.allocPrint(arena, "The agent asks to {s}.", .{title}) catch title,
             .options = options.items,
-            .tool = tid,
+            .tool = tool,
         },
     }) orelse return rid.deinit(s.gpa);
     const asked = api.parse(api.Asked, arena, r) catch return rid.deinit(s.gpa);
-    s.requests.put(s.gpa, asked.question, rid) catch rid.deinit(s.gpa);
+    s.requests.put(s.gpa, asked.question, rid);
 }
 
 // ---- files ----------------------------------------------------------------------------------
