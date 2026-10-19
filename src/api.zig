@@ -9,7 +9,8 @@
 //! `{ message }`, `chat.append_text` `{ chat, message, kind, text }`, `chat.append`
 //! `{ chat, message, block }`, `chat.tool` `{ chat, message, tool }` → `{ tool }`,
 //! `chat.update_tool` `{ chat, tool, update }`, `chat.set_plan` `{ chat, message, entries }`,
-//! `chat.ask` `{ chat, message, question }` → `{ question }`, `chat.set_busy` `{ chat, busy }`,
+//! `chat.ask` `{ chat, message, question }` → `{ question }`, `chat.unask` `{ chat, question }`,
+//! `chat.set_busy` `{ chat, busy }`,
 //! `chat.set_title` `{ chat, title }`, `chat.set_resume` `{ chat, state }`, `chat.focus`
 //! `{ chat }`, `chat.set_settings` `{ chat, settings }`.
 //!
@@ -147,6 +148,9 @@ pub const UpdateTool = struct { chat: ChatId, tool: ToolId, update: ToolUpdate }
 pub const SetPlan = struct { chat: ChatId, message: MessageId, entries: []const PlanEntry };
 pub const Ask = struct { chat: ChatId, message: MessageId, question: Question };
 pub const Asked = struct { question: QuestionId };
+/// A question no longer open (its request went with the agent, or was cancelled): its buttons go,
+/// and it reads as not answered.
+pub const Unask = struct { chat: ChatId, question: QuestionId };
 pub const SetBusy = struct { chat: ChatId, busy: bool };
 pub const SetTitle = struct { chat: ChatId, title: []const u8 };
 pub const SetResume = struct { chat: ChatId, state: []const u8 };

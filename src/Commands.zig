@@ -128,6 +128,7 @@ pub fn register(host: *sdk.Host, owner: *sdk.Plugin) !void {
         .{ "update_tool", api.UpdateTool, cmdUpdateTool },
         .{ "set_plan", api.SetPlan, cmdSetPlan },
         .{ "ask", api.Ask, cmdAsk },
+        .{ "unask", api.Unask, cmdUnask },
         .{ "set_busy", api.SetBusy, cmdSetBusy },
         .{ "set_title", api.SetTitle, cmdSetTitle },
         .{ "set_resume", api.SetResume, cmdSetResume },
@@ -296,6 +297,12 @@ fn cmdAsk(a: api.Ask, call: *sdk.Command.Call) !void {
     defer changed(c);
     const id = c.transcript.ask(a.message, a.question) catch |err| return call.fail("{t}", .{err});
     try call.returns(api.Asked{ .question = id });
+}
+
+fn cmdUnask(a: api.Unask, call: *sdk.Command.Call) !void {
+    const c = try find(a.chat, call);
+    c.transcript.cancelQuestion(a.question);
+    changed(c);
 }
 
 fn cmdSetBusy(a: api.SetBusy, call: *sdk.Command.Call) !void {

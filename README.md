@@ -37,7 +37,10 @@ environment needs fizzy to pass it on, which comes later (the agents plan names 
 
 - Starts the agent, opens a session in the project folder, and hands it `fizzy-mcp`.
 - Streams the agent's messages and thoughts, its plan, and its tool calls as they run.
-- Asks you before the agent acts when it requests permission, with the agent's own options.
+- Asks you before the agent acts when it requests permission, saying what it would do (the
+  command it would run, the file it would change and by how much, the path it would read) with
+  the detail behind the step, and the agent's own options. A request still open when the turn is
+  stopped, the agent exits or it restarts is answered `cancelled`, and its buttons go.
 - Reads files as fizzy's editor has them, unsaved edits included, and writes an open file as one
   undoable edit in the editor, so you watch it land and can undo it; a file that is not open is
   written to disk and shown in a preview tab. (The text plugin's `text.read` / `text.write`.)
@@ -51,6 +54,8 @@ the agent's own session when a chat is reopened.
 
 - `src/acp.zig`: the wire. JSON-RPC 2.0, one message per line on the agent's stdio. std-only,
   tested with `zig build test`.
+- `src/permission.zig`: what a permission request shows (one line per tool kind), and the
+  requests still waiting on an answer. std-only, tested.
 - `src/Agent.zig`: the agent's process, spawned as fizzy spawns a language server (on macOS
   through `core.darwin_spawn`, found on the login shell's PATH), with a reader thread queueing
   lines for the UI thread.

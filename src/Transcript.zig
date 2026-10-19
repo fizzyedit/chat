@@ -301,10 +301,16 @@ pub fn answer(self: *Transcript, qid: chat.QuestionId, option: u32) ?[]const u8 
 
 /// Close every open question: the turn ended without them.
 pub fn cancelQuestions(self: *Transcript) void {
-    for (self.questions.items) |*q| if (q.answer == .open) {
-        q.answer = .cancelled;
-        self.changed(if (q.tool) |t| self.tools.items[t].message else q.message);
-    };
+    for (0..self.questions.items.len) |i| self.cancelQuestion(@intCast(i));
+}
+
+/// Close question `qid` if it is still open: what it asked about went before an answer.
+pub fn cancelQuestion(self: *Transcript, qid: chat.QuestionId) void {
+    if (qid >= self.questions.items.len) return;
+    const q = &self.questions.items[qid];
+    if (q.answer != .open) return;
+    q.answer = .cancelled;
+    self.changed(if (q.tool) |t| self.tools.items[t].message else q.message);
 }
 
 fn listOf(gpa: std.mem.Allocator, text: []const u8) !std.ArrayListUnmanaged(u8) {
@@ -635,6 +641,22 @@ test "a transcript saves and loads back as it was" {
     try std.testing.expectEqual(@as(?chat.QuestionId, 0), back.tools.items[0].question);
     try std.testing.expectEqual(Question.Answer{ .chosen = 0 }, back.questions.items[0].answer);
     try std.testing.expectEqualStrings("only", parts[3].block.plan[0].text);
+}
+
+test "a question closed before its answer loses its buttons, an answered one keeps its answer" {
+    var t: Transcript = .{ .gpa = std.testing.allocator };
+    defer t.deinit();
+    const m = try t.post(.other, &.{});
+    const tid = try t.tool(m, .{ .kind = .execute, .title = "Run" });
+    const answered = try t.ask(m, .{ .text = "", .tool = tid, .options = &.{.{ .id = "y", .label = "Allow", .kind = .allow }} });
+    const open = try t.ask(m, .{ .text = "Run it?", .options = &.{.{ .id = "y", .label = "Allow", .kind = .allow }} });
+    _ = t.answer(answered, 0);
+    t.cancelQuestion(answered);
+    t.cancelQuestion(open);
+    t.cancelQuestion(99);
+    try std.testing.expectEqual(Question.Answer{ .chosen = 0 }, t.questions.items[answered].answer);
+    try std.testing.expectEqual(Question.Answer.cancelled, t.questions.items[open].answer);
+    try std.testing.expect(t.answer(open, 0) == null);
 }
 
 test "a first-version transcript reads as messages" {

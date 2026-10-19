@@ -27,8 +27,15 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/auth.zig"),
     }) });
+    // What a permission request shows, and the requests still waiting on an answer.
+    const permission_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/permission.zig"),
+    }) });
     const test_step = b.step("test", "Run the chat's tests");
     test_step.dependOn(&b.addRunArtifact(auth_tests).step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(transcript_tests).step);
+    test_step.dependOn(&b.addRunArtifact(permission_tests).step);
 }
