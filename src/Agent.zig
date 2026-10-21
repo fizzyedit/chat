@@ -33,8 +33,8 @@ stderr_len: usize = 0,
 pub const StartError = error{ NoCommand, SpawnFailed, OutOfMemory };
 
 /// Spawn `argv` in `cwd` and start reading it. The caller owns the result and calls `stop`.
-/// `forward` names the API key variables the agent may inherit (`env.child`); none by default.
-pub fn start(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []const u8, forward: []const u8, wake: *const fn () void) StartError!*Agent {
+/// `policy` says which API key variables the agent may inherit (`env.child`); none by default.
+pub fn start(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []const u8, policy: env.Policy, wake: *const fn () void) StartError!*Agent {
     if (argv.len == 0) return error.NoCommand;
     const resolved = resolveExecutable(gpa, io, argv[0]);
     defer if (resolved) |r| gpa.free(r);
@@ -43,7 +43,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []co
     @memcpy(full, argv);
     if (resolved) |r| full[0] = r;
 
-    const child = spawn(gpa, io, full, cwd, forward) catch return error.SpawnFailed;
+    const child = spawn(gpa, io, full, cwd, policy) catch return error.SpawnFailed;
     const self = try gpa.create(Agent);
     self.* = .{ .gpa = gpa, .io = io, .wake = wake, .child = child };
     self.reader = std.Thread.spawn(.{}, readStdout, .{self}) catch null;
@@ -57,7 +57,7 @@ pub fn start(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []co
 
 /// macOS has its own allowlisted environment (`core.darwin_spawn`), which holds no API key and
 /// has no way to add one yet; everywhere else `env.child` builds it.
-fn spawn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []const u8, forward: []const u8) !std.process.Child {
+fn spawn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []const u8, policy: env.Policy) !std.process.Child {
     if (comptime builtin.target.os.tag == .macos) {
         return core.darwin_spawn.spawn(gpa, .{
             .argv = argv,
@@ -69,18 +69,7 @@ fn spawn(gpa: std.mem.Allocator, io: Io, argv: []const []const u8, cwd: []const 
     }
     var environ_map = try core.platform.processEnviron().createMap(gpa);
     defer environ_map.deinit();
-    var child_env = try env.child(gpa, &environ_map, forward);
-    defer child_env.deinit();
-    return std.process.spawn(io, .{
-        .argv = argv,
-        .environ_map = &child_env,
-        .cwd = .{ .path = cwd },
-        .stdin = .pipe,
-        .stdout = .pipe,
-        .stderr = .pipe,
-        // Windows only: a console agent from a windowed fizzy would otherwise pop up a console.
-        .create_no_window = true,
-    });
+    return env.spawn(gpa, io, &environ_map, policy, argv, cwd);
 }
 
 /// Write one message (a whole line, newline included). UI thread only.

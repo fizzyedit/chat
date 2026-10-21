@@ -58,14 +58,14 @@ const Launch = struct {
     arena: std.heap.ArenaAllocator,
     argv: []const []const u8 = &.{},
     cwd: []const u8 = "",
-    /// The API key variables to forward to the agent (`env.child`); empty: none.
-    forward: []const u8 = "",
+    /// Which API key variables the agent may inherit (`env.child`); none by default.
+    policy: env.Policy = .{},
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     result: Agent.StartError!*Agent = error.SpawnFailed,
 
     fn run(self: *Launch, gpa: std.mem.Allocator) void {
-        self.result = Agent.start(gpa, dvui.io, self.argv, self.cwd, self.forward, wake);
+        self.result = Agent.start(gpa, dvui.io, self.argv, self.cwd, self.policy, wake);
         self.done.store(true, .release);
         wake();
     }
@@ -448,7 +448,10 @@ fn connect(s: *Session) void {
         return fail(s, "Could not read the agent command.", .{});
     };
     launch.cwd = arena.dupe(u8, workDir(s)) catch "/";
-    launch.forward = arena.dupe(u8, if (settings.use_api_key.get()) settings.api_key_vars.get() else "") catch "";
+    launch.policy = .{
+        .use_api_key = settings.use_api_key.get(),
+        .vars = arena.dupe(u8, settings.api_key_vars.get()) catch "",
+    };
     launch.thread = std.Thread.spawn(.{}, Launch.run, .{ launch, s.gpa }) catch {
         launch.abandon(s.gpa);
         return fail(s, "Could not start the agent: no thread for it.", .{});
@@ -459,20 +462,19 @@ fn connect(s: *Session) void {
     s.state = .starting;
     // Picking a session back up says so when it is open ("Picked up where you left off"); only a
     // new one is worth announcing as it starts.
-    if (s.resume_id == null) note(s, "Starting `{s}` ({s})...", .{ line, authStatus(s, launch.forward) });
+    if (s.resume_id == null) note(s, "Starting `{s}` ({s})...", .{ line, authStatus(launch.policy) });
     setBusy(s, true);
 }
 
 /// How the agent signs in, for the line that says it starts: "plan login", or the API key
 /// variables forwarded (names only). macOS forwards none (`Agent.spawn`).
-fn authStatus(s: *Session, forward: []const u8) []const u8 {
+fn authStatus(policy: env.Policy) []const u8 {
     if (builtin.os.tag == .macos) return "plan login";
-    var environ_map = core.platform.processEnviron().createMap(s.gpa) catch return "plan login";
+    const gpa = sdk.host().arena();
+    var environ_map = core.platform.processEnviron().createMap(gpa) catch return "plan login";
     defer environ_map.deinit();
-    return env.status(&auth_status_buf, &environ_map, forward);
+    return env.status(gpa, &environ_map, policy) catch "plan login";
 }
-
-var auth_status_buf: [256]u8 = undefined;
 
 /// The agent's launch finished on its thread: on to `initialize`, or say why it did not start.
 fn launched(s: *Session) void {
