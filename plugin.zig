@@ -9,12 +9,16 @@
 //! client's group in the sidebar (`src/Explorer.zig`). Agents over ACP are a client here for now
 //! (`src/AcpClient.zig`), on their way to the agent plugin.
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const Chat = @import("src/Chat.zig");
 const View = @import("src/View.zig");
 const Commands = @import("src/Commands.zig");
-const AcpClient = @import("src/AcpClient.zig");
+/// ACP spawns the agent as a process, on a thread: nowhere in a browser. Everything that names it
+/// is behind `has_acp`, so the web build never analyses it.
+const has_acp = builtin.os.tag != .freestanding;
+const AcpClient = if (has_acp) @import("src/AcpClient.zig") else struct {};
 const Explorer = @import("src/Explorer.zig");
 const Settings = @import("src/Settings.zig");
 const DocHandle = sdk.DocHandle;
@@ -70,7 +74,7 @@ var chats: std.AutoArrayHashMapUnmanaged(u64, *Chat) = .empty;
 
 pub fn register(host: *sdk.Host) !void {
     Schema.load(host, plugin_id, &settings);
-    AcpClient.settings = &settings;
+    if (has_acp) AcpClient.settings = &settings;
     Chat.owner = &plugin;
     Commands.chats = &chats;
     plugin.state = @ptrCast(&settings);
@@ -86,7 +90,7 @@ pub fn register(host: *sdk.Host) !void {
     });
     try Commands.register(host, &plugin);
     // Clients of the chat, through its commands like any other plugin.
-    try AcpClient.register(host, &plugin);
+    if (has_acp) try AcpClient.register(host, &plugin);
 }
 
 fn drawExplorer(_: ?*anyopaque) anyerror!dvui.App.Result {
@@ -94,7 +98,7 @@ fn drawExplorer(_: ?*anyopaque) anyerror!dvui.App.Result {
 }
 
 fn beginFrame(_: *anyopaque) void {
-    AcpClient.frame();
+    if (has_acp) AcpClient.frame();
     Explorer.frame(sdk.host());
     for (chats.values()) |c| {
         c.sendQueued();
@@ -111,7 +115,7 @@ fn deinit(_: *anyopaque) void {
         gpa.destroy(c);
     }
     chats.deinit(gpa);
-    AcpClient.deinit(gpa);
+    if (has_acp) AcpClient.deinit(gpa);
     Commands.deinit(gpa);
     Explorer.deinit(gpa);
 }

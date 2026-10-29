@@ -11,6 +11,7 @@
 //! conversation whole. Transcripts from before chats had clients sit directly in `chats/`: they
 //! are the agent's, and move into `chats/agent/` the first time the list is read.
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const core = @import("core");
@@ -73,14 +74,18 @@ pub fn dir(host: *sdk.Host, gpa: std.mem.Allocator) ?[]u8 {
 }
 
 /// A new, empty transcript of `client`'s, written so it opens as theirs, about `folder` (empty:
-/// the one fizzy has open). Owned by `host.allocator`.
-pub fn newPath(host: *sdk.Host, client: []const u8, folder: []const u8) ![]u8 {
+/// the one fizzy has open). Owned by `host.allocator`. With `keeps` (the client holds its own
+/// history, `api.History`) nothing is written: the path only names the chat, and needs no config
+/// folder, so it works where there is none (the web).
+pub fn newPath(host: *sdk.Host, client: []const u8, folder: []const u8, keeps: bool) ![]u8 {
     const gpa = host.allocator;
-    const chats = dir(host, gpa) orelse return error.NoConfigFolder;
+    const chats = dir(host, gpa) orelse if (keeps) try gpa.dupe(u8, "chats") else return error.NoConfigFolder;
     defer gpa.free(chats);
+    // The web has no disk: there a chat is always its client's (a `.chat` one has no config folder).
+    const on_disk = builtin.os.tag != .freestanding and !keeps;
     const client_dir = try std.fs.path.join(gpa, &.{ chats, client });
     defer gpa.free(client_dir);
-    std.Io.Dir.cwd().createDirPath(dvui.io, client_dir) catch {};
+    if (on_disk) std.Io.Dir.cwd().createDirPath(dvui.io, client_dir) catch {};
     // Named by when it began, so names sort as the chats do and never collide in practice.
     const now = std.Io.Clock.real.now(dvui.io).toSeconds();
     const day = std.time.epoch.EpochSeconds{ .secs = @intCast(now) };
@@ -95,10 +100,14 @@ pub fn newPath(host: *sdk.Host, client: []const u8, folder: []const u8) ![]u8 {
             if (n == 0) "" else try std.fmt.bufPrint(name_buf[48..], "-{d}", .{n}),
         });
         const p = try std.fs.path.join(gpa, &.{ client_dir, name });
-        std.Io.Dir.cwd().access(dvui.io, p, .{}) catch break p;
+        // Nothing on disk to collide with, but a chat of this client open under the name.
+        if (!on_disk) {
+            if (host.docFromPath(p) == null) break p;
+        } else std.Io.Dir.cwd().access(dvui.io, p, .{}) catch break p;
         gpa.free(p);
     };
     errdefer gpa.free(path);
+    if (!on_disk) return path;
     var head: std.Io.Writer.Allocating = .init(gpa);
     defer head.deinit();
     const project = if (folder.len > 0) folder else host.folder() orelse "";
@@ -136,6 +145,8 @@ fn migrate(gpa: std.mem.Allocator, chats: []const u8) void {
 fn scan(host: *sdk.Host) void {
     const gpa = host.allocator;
     clear(gpa);
+    // The web has no folder of transcripts to list: a client there lists its own chats.
+    if (comptime builtin.os.tag == .freestanding) return;
     const chats = dir(host, gpa) orelse return;
     defer gpa.free(chats);
     if (!migrated) {
@@ -227,9 +238,11 @@ fn deleteChat(host: *sdk.Host, path: []const u8) void {
         host.closeDocById(doc.id) catch |err| return dvui.log.err("chat: could not close {s}: {t}", .{ path, err });
         if (host.docFromPath(path) != null) return dvui.log.warn("chat: {s} is still open, so it stays", .{path});
     }
+    // The web has no files of a chat's to delete: its client keeps it.
+    if (comptime builtin.os.tag == .freestanding) return changed();
     const cwd = std.Io.Dir.cwd();
     cwd.deleteFile(dvui.io, path) catch |err| return dvui.log.err("chat: could not delete {s}: {t}", .{ path, err });
-    if (Chat.imagesDir(host.allocator, path)) |images| {
+    if (@import("store.zig").imagesDir(host.allocator, path)) |images| {
         defer host.allocator.free(images);
         cwd.deleteTree(dvui.io, images) catch |err| dvui.log.warn("chat: could not delete {s}: {t}", .{ images, err });
     } else |_| {}
@@ -559,7 +572,7 @@ fn newChat(host: *sdk.Host, client: []const u8, folder: []const u8) void {
         _ = host.callCommand(id, args, host.arena());
         return;
     }
-    const path = newPath(host, client, folder) catch |err| return dvui.log.err("chat: could not start a new chat: {t}", .{err});
+    const path = newPath(host, client, folder, Commands.clientKeeps(client)) catch |err| return dvui.log.err("chat: could not start a new chat: {t}", .{err});
     defer host.allocator.free(path);
     _ = host.openFile(.{ .path = path }) catch {};
 }

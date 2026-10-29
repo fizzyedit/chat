@@ -4,6 +4,7 @@
 //! no other client. Nothing here is in fizzy's SDK: the contract is this plugin's, versioned by
 //! `api.version`.
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const api = @import("api.zig");
@@ -17,7 +18,7 @@ pub var chats: *std.AutoArrayHashMapUnmanaged(u64, *Chat) = undefined;
 /// posts land here, and the document adopts them when it registers (`adopt`).
 var opening: std.ArrayListUnmanaged(*Chat) = .empty;
 
-const Client = struct { id: []u8, title: []u8, version: u32 };
+const Client = struct { id: []u8, title: []u8, version: u32, history: api.History };
 /// The registered clients, by id.
 var clients: std.ArrayListUnmanaged(Client) = .empty;
 
@@ -64,6 +65,12 @@ pub fn isRegistered(id: []const u8) bool {
 /// The title a client registered with, for its group in the list.
 pub fn clientTitle(id: []const u8) ?[]const u8 {
     return clients.items[clientIndex(id) orelse return null].title;
+}
+
+/// Whether the client holds `id`'s conversations itself (`api.History`): the chat then writes none
+/// of them. A client that is not registered has no say: its chats stay on disk as they were.
+pub fn clientKeeps(id: []const u8) bool {
+    return (clients.items[clientIndex(id) orelse return false]).history == .client;
 }
 
 pub fn registeredIds(out: *std.ArrayListUnmanaged([]const u8), arena: std.mem.Allocator) void {
@@ -181,7 +188,7 @@ fn cmdRegister(a: api.Register, call: *sdk.Command.Call) !void {
     if (a.version > api.version) return call.fail("this chat speaks version {d} of the contract; {s} asked for {d}", .{ api.version, a.client, a.version });
     if (a.client.len == 0 or std.mem.indexOfAny(u8, a.client, "/\\.") != null) return call.fail("a client id is a plain name: {s}", .{a.client});
     const gpa = sdk.allocator();
-    const entry: Client = .{ .id = try gpa.dupe(u8, a.client), .title = try gpa.dupe(u8, a.title), .version = a.version };
+    const entry: Client = .{ .id = try gpa.dupe(u8, a.client), .title = try gpa.dupe(u8, a.title), .version = a.version, .history = a.history };
     if (clientIndex(a.client)) |i| {
         freeClient(gpa, clients.items[i]);
         clients.items[i] = entry;
@@ -210,7 +217,7 @@ fn cmdOpen(a: api.Open, call: *sdk.Command.Call) !void {
     if (!isRegistered(a.client)) return call.fail("{s} is not registered (chat.register)", .{a.client});
     const host = sdk.host();
     const gpa = sdk.allocator();
-    const path = try Explorer.newPath(host, a.client, a.folder);
+    const path = try Explorer.newPath(host, a.client, a.folder, clientKeeps(a.client));
     defer host.allocator.free(path);
     // The chat exists from now: what the client posts before fizzy has opened its document waits
     // here, and the document adopts it.
@@ -231,6 +238,8 @@ fn cmdOpen(a: api.Open, call: *sdk.Command.Call) !void {
 fn resolve(arena: std.mem.Allocator, b: api.Block) !api.Block {
     if (b != .image or b.image.bytes.len > 0) return b;
     var img = b.image;
+    // An image arrives as bytes on the web, which has no path to read.
+    if (comptime builtin.os.tag == .freestanding) return error.NoFilesOnTheWeb;
     img.bytes = try std.Io.Dir.cwd().readFileAlloc(dvui.io, img.path, arena, .limited(32 * 1024 * 1024));
     if (img.mime.len == 0) img.mime = mimeOf(img.path);
     return .{ .image = img };
@@ -336,6 +345,8 @@ fn cmdSetSettings(a: api.SetSettings, call: *sdk.Command.Call) !void {
 /// What the person's + does, for whoever else attaches: a drop from the file tree, an agent.
 fn cmdAttach(a: api.Attach, call: *sdk.Command.Call) !void {
     const c = if (a.chat != 0) try find(a.chat, call) else front() orelse return call.fail("no chat is in front", .{});
+    // A path is a file on disk; the web has none to attach.
+    if (comptime builtin.os.tag == .freestanding) return call.fail("files cannot be attached on the web", .{});
     std.Io.Dir.cwd().access(dvui.io, a.path, .{}) catch return call.fail("no file at {s}", .{a.path});
     c.attach(a.path);
     changed(c);

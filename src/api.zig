@@ -4,7 +4,7 @@
 //! fingerprint. Bump `version` when a shape changes in a way an older client would misread.
 //!
 //! **What a client calls** (all `visibility = .internal`):
-//! `chat.register` `{ client, title, version }`, `chat.unregister` `{ client }`,
+//! `chat.register` `{ client, title, version, history }`, `chat.unregister` `{ client }`,
 //! `chat.open` `{ client, title }` → `{ chat }`, `chat.post` `{ chat, author, blocks }` →
 //! `{ message }`, `chat.append_text` `{ chat, message, kind, text }`, `chat.append`
 //! `{ chat, message, block }`, `chat.tool` `{ chat, message, tool }` → `{ tool }`,
@@ -129,7 +129,12 @@ pub const TextKind = enum(u8) { text, thought };
 
 // ---- the commands' arguments and results ----------------------------------------------------
 
-pub const Register = struct { client: []const u8, title: []const u8, version: u32 = version };
+/// Who keeps a client's conversations: the chat, as `.chat` transcripts under its config folder
+/// (the default), or the client, which holds them itself: the chat then keeps only the window
+/// it has loaded and writes no transcript or image file for it.
+pub const History = enum(u8) { chat, client };
+
+pub const Register = struct { client: []const u8, title: []const u8, version: u32 = version, history: History = .chat };
 pub const Unregister = struct { client: []const u8 };
 pub const Open = struct {
     client: []const u8,

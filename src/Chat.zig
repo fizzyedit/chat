@@ -6,12 +6,14 @@
 const Chat = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const sdk = @import("fizzy_sdk");
 const dvui = @import("dvui");
 const Transcript = @import("Transcript.zig");
 const View = @import("View.zig");
 const Commands = @import("Commands.zig");
 const chat = @import("api.zig");
+const store = @import("store.zig");
 
 gpa: std.mem.Allocator,
 host: *sdk.Host,
@@ -73,6 +75,8 @@ pub var owner: *sdk.Plugin = undefined;
 
 /// A chat from its transcript on disk; a path with no file yet is a new, empty chat.
 pub fn fromPath(path: []const u8) !Chat {
+    // The web has no transcripts on disk: a chat there starts empty, and its client fills it.
+    if (comptime builtin.os.tag == .freestanding) return fromBytes(path, "");
     const gpa = sdk.allocator();
     const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, path, gpa, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => return fromBytes(path, ""),
@@ -95,7 +99,7 @@ pub fn fromBytes(path: []const u8, bytes: []const u8) !Chat {
     };
     errdefer self.deinitFields();
     if (std.mem.trim(u8, bytes, " \t\r\n").len > 0) {
-        const dir = try imagesDir(gpa, self.path);
+        const dir = try store.imagesDir(gpa, self.path);
         defer gpa.free(dir);
         if (self.transcript.load(bytes, dir, dvui.io)) |h| {
             defer gpa.free(h.client);
@@ -137,12 +141,6 @@ pub fn chatIdOf(path: []const u8) chat.ChatId {
     return h.final() | 1;
 }
 
-/// Where the images of the transcript at `path` are kept: beside it, in a folder of its name.
-pub fn imagesDir(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    const stem = if (std.mem.endsWith(u8, path, ".chat")) path[0 .. path.len - 5] else path;
-    return std.fmt.allocPrint(gpa, "{s}.images", .{stem});
-}
-
 pub fn handle(self: *Chat) sdk.DocHandle {
     return .{ .ptr = self, .id = self.id, .owner = owner };
 }
@@ -155,13 +153,8 @@ pub fn save(self: *Chat) !void {
 }
 
 pub fn write(self: *Chat) !void {
-    var out: std.Io.Writer.Allocating = .init(self.gpa);
-    defer out.deinit();
-    const dir = try imagesDir(self.gpa, self.path);
-    defer self.gpa.free(dir);
-    try self.transcript.save(&out.writer, .{ .client = self.client_id, .title = self.title.items, .folder = self.folder, .@"resume" = self.resume_state }, dir, dvui.io);
-    if (std.fs.path.dirname(self.path)) |d| std.Io.Dir.cwd().createDirPath(dvui.io, d) catch {};
-    try std.Io.Dir.cwd().writeFile(dvui.io, .{ .sub_path = self.path, .data = out.written() });
+    const history: chat.History = if (Commands.clientKeeps(self.client_id)) .client else .chat;
+    try store.write(self.gpa, dvui.io, history, self.path, &self.transcript, .{ .client = self.client_id, .title = self.title.items, .folder = self.folder, .@"resume" = self.resume_state });
     self.saved_version = self.transcript.version;
     self.header_dirty = false;
     @import("Explorer.zig").changed();
@@ -284,6 +277,8 @@ fn sendWith(self: *Chat, text: []const u8, attached: []const Attachment) bool {
     var sent: std.ArrayListUnmanaged(chat.Block) = .empty;
     if (trimmed.len > 0) shown.append(arena, .{ .text = trimmed }) catch return false;
     for (attached) |a| {
+        // Attachments are files on disk; the web has none to read.
+        if (comptime builtin.os.tag == .freestanding) continue;
         if (a.image()) {
             const bytes = std.Io.Dir.cwd().readFileAlloc(dvui.io, a.path, arena, .limited(32 * 1024 * 1024)) catch continue;
             shown.append(arena, .{ .image = .{ .mime = a.mime, .bytes = bytes, .alt = std.fs.path.basename(a.path) } }) catch {};
