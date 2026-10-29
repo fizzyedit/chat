@@ -11,6 +11,7 @@
 const Transcript = @This();
 
 const std = @import("std");
+const builtin = @import("builtin");
 const chat = @import("api.zig");
 
 gpa: std.mem.Allocator,
@@ -440,6 +441,8 @@ fn savedBlock(arena: std.mem.Allocator, b: *const Block, images_dir: []const u8,
         .image => |i| blk: {
             const name = try std.fmt.allocPrint(arena, "{x:0>16}.{s}", .{ i.hash, extensionOf(i.mime) });
             const path = try std.fs.path.join(arena, &.{ images_dir, name });
+            // No images folder on the web: a transcript is never written to disk there.
+            if (comptime builtin.os.tag == .freestanding) break :blk .{ .image = .{ .mime = i.mime, .file = name, .alt = i.alt } };
             std.Io.Dir.cwd().access(io, path, .{}) catch {
                 std.Io.Dir.cwd().createDirPath(io, images_dir) catch {};
                 try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = i.bytes });
@@ -539,6 +542,8 @@ fn loadedBlock(self: *Transcript, arena: std.mem.Allocator, p: SavedPart, images
         .thought => |t| try Block.copy(self.gpa, .{ .thought = t }),
         .code => |c| try Block.copy(self.gpa, .{ .code = .{ .language = c.language, .text = c.text } }),
         .image => |i| blk: {
+            // No images folder on the web: a transcript is never read from disk there.
+            if (comptime builtin.os.tag == .freestanding) break :blk null;
             const path = try std.fs.path.join(arena, &.{ images_dir, std.fs.path.basename(i.file) });
             const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024 * 1024)) catch break :blk null;
             break :blk try Block.copy(self.gpa, .{ .image = .{ .mime = i.mime, .bytes = bytes, .alt = i.alt } });

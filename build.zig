@@ -39,10 +39,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .root_source_file = b.path("src/env.zig"),
     }) });
+    // Where a conversation is written, and that a client holding its own history gets no file.
+    const store_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/store.zig"),
+    }) });
     const test_step = b.step("test", "Run the chat's tests");
     test_step.dependOn(&b.addRunArtifact(auth_tests).step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
     test_step.dependOn(&b.addRunArtifact(transcript_tests).step);
     test_step.dependOn(&b.addRunArtifact(permission_tests).step);
     test_step.dependOn(&b.addRunArtifact(env_tests).step);
+    test_step.dependOn(&b.addRunArtifact(store_tests).step);
 }
