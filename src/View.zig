@@ -18,6 +18,7 @@ const api = @import("api.zig");
 const Chat = @import("Chat.zig");
 const Commands = @import("Commands.zig");
 const Transcript = @import("Transcript.zig");
+const composer = @import("composer.zig");
 
 const entypo = dvui.entypo;
 
@@ -815,14 +816,14 @@ fn drawInput(c: *Chat) void {
         .gravity_y = 1,
         .corners = .all(14),
         .padding = .{ .x = 10, .y = 6, .w = 10, .h = 6 },
-        // A line tall to start, growing with what is typed up to six lines, then scrolling.
+        // A line tall to start, growing with what is typed up to eight lines, then scrolling.
         .min_size_content = .{ .w = 40, .h = theme.font_body.lineHeight() },
-        .max_size_content = .{ .w = std.math.floatMax(f32), .h = theme.font_body.lineHeight() * 6 },
+        .max_size_content = .{ .w = std.math.floatMax(f32), .h = theme.font_body.lineHeight() * composer.max_lines },
     });
-    // Enter sends; Shift+Enter is a new line, as the entry would make it.
+    // Enter sends on a desktop; on a phone, and with Shift, it is a new line, as the entry would make it.
     for (dvui.events()) |*e| {
         if (!te.matchEvent(e)) continue;
-        if (e.evt == .key and e.evt.key.action == .down and e.evt.key.code == .enter and !e.evt.key.mod.shift()) {
+        if (e.evt == .key and e.evt.key.action == .down and e.evt.key.code == .enter and composer.enter(e.evt.key.mod.shift(), composer.isMobile()) == .send) {
             e.handle(@src(), te.data());
             send_now = true;
         }
